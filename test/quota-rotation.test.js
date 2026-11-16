@@ -252,6 +252,35 @@ test('a huge tool-result history is reduced under the budget', () => {
   assert.ok(serialized.includes('"truncated":true'), 'oversized tool payloads must be truncated');
 });
 
+test('the trim terminates when the tool schemas alone exceed the budget', () => {
+  // Regression: shrinking the system prompt near its floor re-added a marker
+  // each pass, so the body never shrank and the event loop spun forever.
+  const tools = [];
+  for (let i = 0; i < 40; i++) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: `tool_${i}`,
+        description: 'D'.repeat(15000),
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+      },
+    });
+  }
+
+  const started = Date.now();
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'system', content: 'S'.repeat(6000) }, { role: 'user', content: 'ok' }],
+    tools,
+  });
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 5000, `the trim must terminate, took ${elapsed}ms`);
+  const bytes = Buffer.byteLength(JSON.stringify(body));
+  assert.ok(bytes < 200_000, `tool descriptions must be truncated, got ${bytes} bytes`);
+  assert.ok(JSON.stringify(body).includes('truncated by provider-agy'));
+});
+
 test('a small request is sent unchanged', () => {
   const { body } = buildCloudRequest({
     model: MODEL,

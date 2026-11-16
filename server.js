@@ -361,6 +361,34 @@ function isUserTextEntry(entry) {
 }
 
 const PART_TRUNCATE_CHARS = Number(process.env.AGY_PART_TRUNCATE_CHARS || 8000);
+const MAX_TRIM_ITERATIONS = 500;
+const SYSTEM_FLOOR_CHARS = 2000;
+const SYSTEM_MARKER = '\n[... truncated by provider-agy to fit the backend context limit ...]';
+const SYSTEM_FLOOR_TEXT = '[system prompt removed by provider-agy to fit the backend context limit]';
+const TOOL_DESCRIPTION_LIMIT = 1000;
+
+/**
+ * Truncates tool descriptions when the tool schemas alone exceed the budget.
+ * Names and parameters stay intact: the model needs them to call the tool.
+ */
+function shrinkOversizedTool(body) {
+  const tools = body.request?.tools;
+  if (!Array.isArray(tools)) return false;
+  for (const tool of tools) {
+    for (const fn of tool.functionDeclarations || []) {
+      const description = fn.description;
+      // Re-cutting must not match its own output: 400 chars plus the marker
+      // stays below this threshold, so each tool is shrunk exactly once.
+      if (typeof description === 'string' && description.length > TOOL_DESCRIPTION_LIMIT) {
+        const next = `${description.slice(0, 400)}${SYSTEM_MARKER}`;
+        if (next.length >= description.length) continue;
+        fn.description = next;
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Truncates the oldest oversized part below `limit` entries and returns whether
@@ -429,9 +457,14 @@ function trimToBudget(body) {
 
   // 3) Last resort: a single tool result can be larger than the whole budget
   // and no turn boundary saves us. Truncate the oldest oversized payloads,
-  // preferring anything older than the current turn.
+  // preferring anything older than the current turn. Every step must strictly
+  // shrink the body, and the iteration count is bounded, so this can never
+  // spin: an earlier version re-added a marker every pass and hung the event
+  // loop.
   let truncatedParts = 0;
-  while (estimate() > MAX_INPUT_TOKENS) {
+  let iterations = 0;
+  while (estimate() > MAX_INPUT_TOKENS && iterations < MAX_TRIM_ITERATIONS) {
+    iterations++;
     if (shrinkOldestOversizedPart(contents, contents.length - 1)) {
       truncatedParts++;
       continue;
@@ -440,12 +473,19 @@ function trimToBudget(body) {
       truncatedParts++;
       continue;
     }
-    // Nothing else left to shrink: cut the system prompt past its normal floor
-    // so the request never leaves over budget.
-    if (sys && typeof sys.text === 'string' && sys.text.length > 2000) {
-      const target = Math.max(2000, Math.floor(sys.text.length / 2));
-      trimmedTokens += sys.text.length - target;
-      sys.text = `${sys.text.slice(0, target)}\n[... truncated by provider-agy to fit the backend context limit ...]`;
+    if (shrinkOversizedTool(body)) {
+      truncatedParts++;
+      continue;
+    }
+    if (sys && typeof sys.text === 'string' && sys.text.length > SYSTEM_FLOOR_CHARS) {
+      const target = Math.max(SYSTEM_FLOOR_CHARS, Math.floor(sys.text.length / 2));
+      const next =
+        target + SYSTEM_MARKER.length < sys.text.length
+          ? `${sys.text.slice(0, target)}${SYSTEM_MARKER}`
+          : `${SYSTEM_FLOOR_TEXT}`;
+      if (next.length >= sys.text.length) break;
+      trimmedTokens += sys.text.length - next.length;
+      sys.text = next;
       continue;
     }
     break;
