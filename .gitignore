@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+accounts.json
+state.json
+oauth.json
+.agy-token*
+logs/
+capture.ndjson
+capture-req.json
+capture-resp.txt
+capture-server.log
+stream-tool.txt
+big-prompt.txt
+test-workspace/
+*.log

@@ -1,0 +1,342 @@
+# provider-agy
+
+Provider **OpenAI-compatible** local que usa o backend do **Antigravity CLI (`agy`)** já logado na sua conta, para codar com o **omp (Oh My Pi)** e outros clientes que falem OpenAI Chat Completions.
+
+O cliente fala com um servidor local; o servidor traduz para o mesmo protocolo que o `agy` usa no Cloud Code do Google. Nenhum header de “cliente alternativo” é inventado: o fingerprint HTTP replica o do `agy`.
+
+> Projeto não oficial, sem vínculo com o Google. Use por sua conta e risco.
+
+## Como funciona
+
+1. Lê o token OAuth da mesma entrada de keyring do `agy` (`gemini:antigravity`) e guarda uma cópia em um cofre local multi-contas.
+2. Quando o access token expira, renova com o client OAuth do `agy` (configurado localmente, fora do repositório) e salva o token renovado no cofre.
+3. Envia `POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` com:
+   - o mesmo `User-Agent` do `agy` (`antigravity/cli/1.5.9 (...)`),
+   - o mesmo envelope (`project`, `requestId`, `request`, `model`, `userAgent`, `requestType`),
+   - os mesmos `labels` internos (`model_enum`, `cascade_id`, `trajectory_id`, etc.),
+   - `generationConfig` por modelo (`thinkingLevel` no Gemini, `thinkingBudget` no Claude/GPT-OSS).
+4. Traduz mensagens e tools entre OpenAI e o formato Gemini/Claude do Cloud Code, preservando:
+   - `functionCall.id` e `functionResponse.id` (obrigatórios no Claude),
+   - `thoughtSignature` (obrigatório no Gemini 3 em turnos com tool call), persistido em `~/.provider-agy/state.json` para sobreviver a reinícios,
+   - streaming SSE, tool calls, `reasoning_content` e usage.
+
+Sessões criadas antes da persistência, ou cujo tool call antigo não tem assinatura, têm esse par `functionCall`/`functionResponse` descartado no reenvio ao Gemini em vez de devolver 400.
+
+## Requisitos
+
+- **Windows** com `agy` instalado e **logado** (`agy -p "ok"` deve responder). A leitura do keyring usa a API de Credenciais do Windows.
+- Node.js 18+ (testado com Node 24).
+- `omp` 18.x (opcional; qualquer cliente OpenAI-compatible serve).
+
+## Instalação
+
+```bash
+git clone https://github.com/dilneiss/omp-agy-provider-proxy.git
+cd omp-agy-provider-proxy
+npm start
+```
+
+Não há dependências externas: `npm start` roda direto com o Node. Na primeira execução, o provider importa automaticamente a conta que estiver logada no `agy`.
+
+O servidor escuta em `http://127.0.0.1:8788/v1`. Para parar, use `Ctrl+C`.
+
+### Configurar o client OAuth
+
+O refresh do token usa o mesmo client OAuth embutido no binário do `agy`. Essas credenciais **não ficam neste repositório**; configure uma das opções abaixo:
+
+**Opção A — arquivo local (recomendado):** crie `~/.provider-agy/oauth.json`:
+
+```json
+{
+  "clientId": "<id>.apps.googleusercontent.com",
+  "clientSecret": "GOCSPX-<secret>"
+}
+```
+
+**Opção B — variáveis de ambiente:**
+
+```bash
+AGY_OAUTH_CLIENT_ID='<id>.apps.googleusercontent.com' \
+AGY_OAUTH_CLIENT_SECRET='GOCSPX-<secret>' \
+npm start
+```
+
+Os dois valores estão embutidos no executável do `agy` instalado na sua máquina. Localize o binário com `where agy` (Windows) e extraia as strings `*.apps.googleusercontent.com` e `GOCSPX-...` com a ferramenta que preferir (`strings`, editor hexadecimal etc.). O arquivo `oauth.json` fica fora do repositório e é ignorado pelo Git.
+
+Sem essas credenciais o provider continua funcionando com o access token atual até ele expirar; depois disso o refresh falha com uma mensagem explicando o que configurar.
+
+O cofre de contas e o `oauth.json` ficam em `~/.provider-agy/` (ou em `AGY_STATE_DIR`).
+
+## Uso com o omp
+
+Em um terminal, deixe o provider rodando:
+
+```bash
+npm start
+# ou, no Windows:
+start.cmd
+```
+
+Em outro terminal:
+
+```bash
+omp --model agy/gemini-3.8-flash-high
+```
+
+Ou use o launcher que sobe o provider se necessário e abre o omp:
+
+```bash
+omp-agy.cmd
+```
+
+Para listar/validar os modelos:
+
+```bash
+omp models agy
+```
+
+Modelos expostos (os mesmos `agy models`):
+
+| id | nome | contexto | saída |
+|---|---|---|---|
+| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | 1M | 64K |
+| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | 1M | 64K |
+| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | 1M | 64K |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | 250K | 64K |
+| `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | 250K | 64K |
+| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | 128K | 32K |
+
+### Registrar no omp
+
+Registre um provider no `~/.omp/agent/models.yml` apontando para `http://127.0.0.1:8788/v1` com `api: openai-completions` e os ids da tabela acima. Exemplo de bloco (ajuste ao formato da sua versão do omp):
+
+```yaml
+agy:
+  baseUrl: http://127.0.0.1:8788/v1
+  api: openai-completions
+  models:
+    - gemini-3.8-flash-high
+    - gemini-3.8-flash-medium
+    - gemini-3.8-flash-low
+    - claude-sonnet-4-6
+    - claude-opus-4-6-thinking
+    - gpt-oss-120b-medium
+```
+
+Para tornar o modelo padrão do omp:
+
+```bash
+omp config set modelRoles '{"default":"agy/gemini-3.8-flash-high"}'
+```
+
+> Isso faz todo `omp` depender do provider local estar rodando. Se preferir, use `--model agy/...` só quando quiser.
+
+## Multi-contas e fallback automático
+
+O provider mantém um cofre local em `~/.provider-agy/accounts.json` com todas as contas que você importar. O keyring do `agy` continua sendo a fonte da conta “atual”; o cofre é independente e guarda as demais.
+
+Ao subir, o provider importa automaticamente a conta que estiver no keyring. Assim você pode trocar de conta no `agy` sem perder o token que já estava salvo.
+
+### Adicionar outra conta sem perder a atual
+
+```bash
+# 1. guarda a conta logada agora
+npm run accounts -- add
+
+# 2. entre na outra conta pelo próprio agy (/login na TUI ou agy acp --login)
+
+# 3. importa a nova conta; a anterior continua no cofre
+npm run accounts -- add
+
+# 4. confira
+npm run accounts -- list
+npm run accounts -- quota
+```
+
+O comando é idempotente: importar a mesma conta de novo atualiza o token dela em vez de criar duplicata.
+
+### Comandos de contas
+
+| comando | efeito |
+|---|---|
+| `npm run accounts -- list` | lista contas, projeto e quota; marca a ativa com `*` |
+| `npm run accounts -- add [nome]` | importa a conta logada no `agy` para o cofre |
+| `npm run accounts -- use <email-ou-índice>` | faz o `agy` usar essa conta (grava o blob no keyring) |
+| `npm run accounts -- remove <email-ou-índice>` | remove do cofre sem mexer no keyring |
+| `npm run accounts -- quota` | consulta a quota real de cada conta e modelo |
+| `npm run accounts -- login` | mostra o passo a passo acima |
+| `npm run quota` | atalho de diagnóstico de quota usando o cofre inteiro |
+
+Exemplos:
+
+```bash
+npm run accounts -- add
+npm run accounts -- add trabalho
+npm run accounts -- list
+npm run accounts -- use 2
+npm run accounts -- use conta@exemplo.com
+npm run accounts -- remove conta@exemplo.com
+```
+
+Saída típica do `list` (dados apenas ilustrativos):
+
+```text
+Contas no cofre (2):
+* 1. conta-a@exemplo.com
+     projeto: aicode-consumers
+     quota: flash-high=95% sonnet-4-6=0%
+  2. conta-b@exemplo.com
+     projeto: aicode-consumers
+
+* = conta ativa no provider
+```
+
+### Como o roteamento funciona
+
+- O provider tenta primeiro a **conta ativa**. Se ela responder, continua ativa (sticky).
+- Em **429 de quota** (`QUOTA_EXHAUSTED`, `quotaResetTimeStamp` ou mensagem de “individual quota”), a conta é marcada como esgotada **para aquele modelo** até o horário de reset e o provider tenta a próxima conta automaticamente.
+- O fallback é **por modelo**: Claude esgotado não impede o Gemini, e vice-versa.
+- Se a conta responder com sucesso, ela vira a ativa e a marcação de esgotada é removida.
+- Um **429 genérico** (sem detalhes de quota, típico de entrada grande no Gemini) **não** troca de conta: trocar não resolveria e queimaria as demais.
+- Um **401** força o refresh do token daquela conta e repete uma vez. Se continuar inválida, a conta é marcada como inválida e o provider passa para a próxima.
+- **5xx** tem um retry por conta antes de passar para a próxima.
+- Se todas as contas estiverem sem quota, a resposta é `429` com o horário da próxima liberação. Se não houver nenhuma conta utilizável, é `503`.
+
+O status das contas aparece em:
+
+```bash
+curl http://127.0.0.1:8788/health
+curl http://127.0.0.1:8788/v1/accounts
+```
+
+### Cofre e segurança dos tokens
+
+- Arquivo: `~/.provider-agy/accounts.json` (ou `AGY_STATE_DIR/accounts.json`).
+- Guarda token de acesso, refresh token, e-mail de identificação, projeto e quota de cada conta.
+- No Windows, o arquivo recebe ACL restrita ao seu usuário (`icacls`).
+- O cofre fica **fora do repositório** e `accounts.json`/`state.json` estão no `.gitignore`. Nunca faça commit dele.
+- `npm run accounts -- use` é a única operação que altera o keyring do `agy`; o uso normal do provider não mexe nele.
+
+## Limites: contexto, requisição e quota
+
+Há três limites diferentes — não confunda a janela de contexto com a cota:
+
+| limite | valor observado |
+|---|---|
+| Janela de contexto Gemini 3.8 Flash | **1.048.576** tokens (1M) |
+| Janela de contexto Claude Sonnet/Opus 4.6 | **250.000** tokens |
+| Janela de contexto GPT-OSS 120B | **131.072** tokens (128K) |
+| Saída máxima Gemini / Claude / GPT-OSS | 65.536 / 64.000 / 32.768 |
+| Entrada por requisição na rota Cloud Code | **~40k tokens** (acima disso: 429) |
+| Quota | por modelo, com `remainingFraction` e `resetTime` |
+
+O limite de ~40k tokens não é a janela do modelo: é um teto prático da rota/plano. Nos testes, ~140k caracteres (~39,8k tokens) passaram e ~160k (~45k) falharam, mesmo com quota sobrando. Um prompt cheio de skills/MCP no omp pode chegar a ~174 KB (~46k tokens), então não passaria sem ajuste.
+
+Para consultar a quota real (não gasta quota de geração):
+
+```bash
+npm run quota
+# ou
+npm run accounts -- quota
+```
+
+O backend informa `remainingFraction` e `resetTime` por modelo. Modelos sem `remainingFraction` estão com 0 restante até o reset informado. O mesmo Claude esgotado retorna 429 também no `agy` oficial (`agy --model claude-sonnet-4-6 -p='OK'`); o `agy` continua funcionando no Gemini porque a quota é separada por modelo.
+
+### Ajuste automático de contexto
+
+Para funcionar com o omp cheio de skills, o provider impõe um orçamento conservador (padrão **38k tokens**):
+
+- remove turnos antigos inteiros (sem quebrar pares `functionCall`/`functionResponse`);
+- se ainda faltar espaço, trunca a **cauda** do system prompt (catálogo de skills/MCP), preservando o começo, que contém as instruções principais;
+- registra o ajuste no stderr e segue.
+
+Se você não precisa de todas as skills/MCP no omp, isso também reduz bastante o prompt:
+
+```bash
+omp --model agy/claude-sonnet-4-6 --no-skills --no-rules --no-context-files --no-extensions
+```
+
+## Variáveis de ambiente
+
+| variável | padrão | efeito |
+|---|---|---|
+| `AGY_PROVIDER_HOST` | `127.0.0.1` | endereço local do servidor |
+| `AGY_PROVIDER_PORT` | `8788` | porta local |
+| `AGY_MAX_INPUT_TOKENS` | `38000` | orçamento de tokens de entrada por requisição |
+| `AGY_TRIM` | `1` | `0` desabilita o ajuste de contexto (pode tomar 429) |
+| `AGY_PROJECT` | `aicode-consumers` | projeto enviado ao Cloud Code |
+| `AGY_STATE_DIR` | `~/.provider-agy` | cofre de contas, `oauth.json` e assinaturas de tool calls |
+| `AGY_ACCESS_TOKEN` | — | usa um token fixo e ignora keyring/cofre |
+| `AGY_KEYRING_TARGET` | `gemini:antigravity` | entrada do Credential Manager usada pelo `agy` |
+| `AGY_OAUTH_CLIENT_ID` | — | client OAuth usado no refresh (ou use `oauth.json`) |
+| `AGY_OAUTH_CLIENT_SECRET` | — | secret OAuth usado no refresh (ou use `oauth.json`) |
+| `AGY_CLOUD_CODE_HOST` | `daily-cloudcode-pa.googleapis.com` | host do Cloud Code |
+| `AGY_DEBUG_FC` | — | `1` loga os `functionCall` recebidos |
+
+## Verificação rápida
+
+```bash
+# credencial do agy funcionando?
+agy -p "ok"
+
+# servidor e contas
+curl http://127.0.0.1:8788/health
+curl http://127.0.0.1:8788/v1/accounts
+curl http://127.0.0.1:8788/v1/models
+
+# request não-streaming
+curl -s -X POST http://127.0.0.1:8788/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"Responda apenas OK"}],"stream":false}'
+
+# request streaming
+curl -N -X POST http://127.0.0.1:8788/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"Responda apenas OK"}],"stream":true}'
+```
+
+Fluxos validados neste projeto:
+
+- leitura, criação e edição de arquivos via tool calls com Gemini e Claude;
+- streaming SSE, `functionCall`, `functionResponse`, `thoughtSignature` e usage;
+- importação de conta do keyring para o cofre;
+- fallback automático quando a conta ativa está inválida;
+- resposta 429 com horário de reset quando todas as contas estão sem quota para o modelo.
+
+## Diagnóstico
+
+| sintoma | causa provável | o que fazer |
+|---|---|---|
+| `CredRead failed` / keyring não encontrado | `agy` não está logado nesta máquina | rode `agy -p "ok"` e faça login |
+| `client OAuth do agy não configurado` | faltam as credenciais de refresh | crie `~/.provider-agy/oauth.json` ou defina `AGY_OAUTH_CLIENT_ID`/`AGY_OAUTH_CLIENT_SECRET` |
+| `invalid_grant` em uma conta | refresh token revogado/expirado | faça login de novo no `agy` e rode `npm run accounts -- add` |
+| `429 QUOTA_EXHAUSTED` | quota do modelo esgotada | aguarde o `resetTime` ou adicione outra conta ao cofre |
+| `429` sem detalhes, em prompt grande | limite de entrada por requisição (~40k tokens) | reduza `AGY_MAX_INPUT_TOKENS`, remova skills/MCP ou diminua o contexto |
+| `nenhuma conta disponível` | cofre vazio ou todas inválidas | `npm run accounts -- list` e `npm run accounts -- add` |
+| porta 8788 ocupada | outro provider/processo rodando | pare o processo ou use `AGY_PROVIDER_PORT=8790` |
+
+Para parar um processo antigo na porta (Windows):
+
+```bash
+netstat -ano | findstr :8788
+taskkill /PID <pid> /F
+```
+
+## Estrutura do projeto
+
+```text
+server.js              servidor HTTP, tradução OpenAI <-> Cloud Code, streaming e tools
+lib/accounts.js        cofre multi-contas, refresh OAuth, quota, seleção e fallback
+tools/accounts.js      CLI de contas (list/add/use/remove/quota/login)
+tools/quota.js         diagnóstico de quota usando o cofre
+tools/keyring.ps1      leitura/escrita do Credential Manager do Windows
+start.cmd              inicia o provider no Windows
+omp-agy.cmd            sobe o provider se necessário e abre o omp
+```
+
+## Aviso
+
+- O repositório não contém tokens de conta. O cofre fica na sua pasta de usuário e nunca deve ser commitado.
+- O client OAuth usado é o mesmo embutido no binário distribuído do `agy`, mas **não é distribuído neste repositório**: você o configura em `~/.provider-agy/oauth.json` ou pelas variáveis `AGY_OAUTH_CLIENT_ID`/`AGY_OAUTH_CLIENT_SECRET`.
+- Usar a credencial do Antigravity fora do cliente oficial pode contrariar os termos do serviço. O fingerprint replica o `agy`, mas isso não garante ausência de bloqueios.
+- O limite de ~40k tokens e o formato do Cloud Code são do backend e podem mudar sem aviso.
