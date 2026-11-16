@@ -20,6 +20,36 @@ const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 const accounts = require('./lib/accounts');
 
+// The omp extension spawns the provider with stdio ignored, so console output
+// never reaches a terminal. Mirror warnings and errors into a log file so an
+// upstream rejection can be diagnosed after the fact.
+const LOG_FILE = process.env.AGY_LOG_FILE || path.join(accounts.STATE_DIR, 'provider.log');
+const LOG_MAX_BYTES = Number(process.env.AGY_LOG_MAX_BYTES || 2 * 1024 * 1024);
+
+function appendLog(level, args) {
+  try {
+    const text = args
+      .map((value) => {
+        if (typeof value === 'string') return value;
+        try { return JSON.stringify(value); } catch { return String(value); }
+      })
+      .join(' ');
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    try {
+      if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.truncateSync(LOG_FILE, 0);
+    } catch {}
+    fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${level} ${text}\n`);
+  } catch {}
+}
+
+for (const level of ['warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    appendLog(level.toUpperCase(), args);
+    original(...args);
+  };
+}
+
 const VERSION = '1.5.9';
 const CLOUD_CODE_HOST = process.env.AGY_CLOUD_CODE_HOST || 'daily-cloudcode-pa.googleapis.com';
 const PROJECT = process.env.AGY_PROJECT || 'aicode-consumers';
@@ -288,10 +318,11 @@ function rememberToolCall(id, name, signature) {
   persistState();
 }
 
-// The Antigravity backend rejects (429 RESOURCE_EXHAUSTED) requests with more
-// than ~40k uncached input tokens. The default omp prompt with many skills/MCP
-// entries exceeds that, so we enforce a conservative budget.
-const MAX_INPUT_TOKENS = Number(process.env.AGY_MAX_INPUT_TOKENS || 38000);
+// Cloud Code can return an ambiguous 429 when uncached OMP context (system
+// prompt, tools and conversation) exceeds roughly 40k tokens. Keep a wider
+// margin than the old 38k estimate because this character-based estimate
+// undercounts code-heavy and structured prompts.
+const MAX_INPUT_TOKENS = Number(process.env.AGY_MAX_INPUT_TOKENS || 30000);
 const CHARS_PER_TOKEN = 3.5;
 
 function estimateTokens(obj) {
@@ -826,6 +857,13 @@ function rateLimitCooldownMs(upstreamDelay) {
   return Math.min(upstreamDelay || RATE_LIMIT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_MAX_MS);
 }
 
+// Every vault account signs in to the same Cloud Code project, so a bare 429
+// with no quota evidence is a rejection of the request or of the shared
+// project, not of one account. Rotating through the vault then only produces a
+// storm of switch notices. Retry the set once after a short pause first.
+const ROTATION_ROUNDS = Math.max(1, Number(process.env.AGY_ROTATION_ROUNDS || 2));
+const ROTATION_ROUND_MAX_WAIT_MS = Number(process.env.AGY_ROTATION_ROUND_MAX_WAIT_MS || 1500);
+
 /** Wait the backend asked for, taken from the header or the RetryInfo delay. */
 function retryAfterMs(headers, text) {
   const header = Number(headers?.['retry-after']);
@@ -1027,13 +1065,45 @@ async function postWithAccounts(body, modelId) {
     };
   }
 
-  while (true) {
+  let round = 1;
+  let deferredWaitMs = 0;
+  // Cooldowns earned by unconfirmed 429s are applied only when the request
+  // gives up, so a retry round can reuse the same accounts.
+  const deferredCooldown = new Map();
+
+  rotation: while (true) {
     if (accounts.isBlocked()) {
       return { statusCode: 403, text: blockedMessage() };
     }
     const account = accounts.selectAccountsFor(modelId).find((a) => !tried.has(a.id));
-    if (!account) break;
+    if (!account) {
+      const resetKnown = accounts.nextResetFor(modelId);
+      if (round < ROTATION_ROUNDS && deferredWaitMs > 0 && !resetKnown) {
+        const wait = Math.min(Math.max(deferredWaitMs, 300), ROTATION_ROUND_MAX_WAIT_MS);
+        console.warn(
+          `[agy] every account answered an unconfirmed 429 for ${modelId}; retrying after ${wait}ms (round ${round + 1}/${ROTATION_ROUNDS})`
+        );
+        await sleep(wait);
+        tried.clear();
+        deferredWaitMs = 0;
+        round += 1;
+        continue rotation;
+      }
+      break;
+    }
     tried.add(account.id);
+    if (pendingSwitch && pendingSwitch.fromId !== account.id) {
+      const change = pendingSwitch;
+      pendingSwitch = null;
+      pushAccountEvent({
+        type: 'switch',
+        model: modelId,
+        reason: change.reason,
+        message: change.message || null,
+        from: accountSnapshot(change.fromId, modelId),
+        to: accountSnapshot(account.id, modelId),
+      });
+    }
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       if (accounts.isBlocked()) {
@@ -1107,6 +1177,11 @@ async function postWithAccounts(body, modelId) {
         let isQuota = quota.isQuota;
         let resetAt = quota.resetAt;
         const upstreamDelay = retryAfterMs(out.headers, out.text);
+        // Capture enough context to distinguish an input-size rejection from
+        // account/project throttling without ever logging prompt or token data.
+        console.warn(
+          `[agy] 429 diagnostics: model=${modelId} project=${body.project || '?'} account=${account.email || account.id} status=${out.statusCode} inputEstimate=${estimateTokens(body)} limit=${MAX_INPUT_TOKENS} bodyBytes=${Buffer.byteLength(JSON.stringify(body))} quotaEvidence=${isQuota ? 'confirmed' : quota.ambiguous ? 'ambiguous' : 'none'}`
+        );
 
         // A bare 429 is ambiguous. Do not make an extra network request to
         // fetch quota before trying the next account: that serial lookup is
@@ -1127,16 +1202,12 @@ async function postWithAccounts(body, modelId) {
             resetAt = reset;
           } else {
             const cooldownMs = rateLimitCooldownMs(upstreamDelay);
-            accounts.markCooldown(
-              account.id,
-              modelId,
-              new Date(Date.now() + cooldownMs).toISOString(),
-              quota.message
-            );
+            if (!deferredCooldown.has(account.id)) {
+              deferredCooldown.set(account.id, { cooldownMs, message: quota.message, at: Date.now() });
+            }
+            deferredWaitMs = Math.max(deferredWaitMs, cooldownMs);
             console.warn(
-              `[agy] 429 on ${account.email} for ${modelId} with quota state not freshly confirmed; parked for ${Math.round(
-                cooldownMs / 1000
-              )}s and trying next account`
+              `[agy] 429 on ${account.email} for ${modelId} with quota state not freshly confirmed; trying next account`
             );
           }
         }
@@ -1152,8 +1223,8 @@ async function postWithAccounts(body, modelId) {
         } else if (!pendingSwitch) {
           pendingSwitch = {
             fromId: account.id,
-            reason: 'error',
-            message: `HTTP 429: ${quota.message}`,
+            reason: 'rate-limited',
+            message: `HTTP 429 without quota evidence: ${quota.message}`,
           };
         }
 
@@ -1180,6 +1251,17 @@ async function postWithAccounts(body, modelId) {
 
       return { statusCode: out.statusCode, headers: out.headers, text: out.text };
     }
+  }
+
+  // The request gave up: park the accounts that refused it so the next request
+  // starts elsewhere, instead of re-trying the same rejected path immediately.
+  for (const [accountId, info] of deferredCooldown) {
+    accounts.markCooldown(
+      accountId,
+      modelId,
+      new Date(info.at + info.cooldownMs).toISOString(),
+      info.message
+    );
   }
 
   const next = accounts.nextResetFor(modelId);
@@ -1715,4 +1797,4 @@ process.on('SIGTERM', () => {
   server.close(() => process.exit(0));
 });
 
-module.exports = { postWithAccounts, rotationDeps };
+module.exports = { postWithAccounts, rotationDeps, buildCloudRequest };
