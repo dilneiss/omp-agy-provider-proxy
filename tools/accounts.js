@@ -259,6 +259,93 @@ function cmdRemove(query) {
   console.log(`Removed from vault: ${account.email || account.id} (keyring unchanged)`);
 }
 
+/**
+ * Accounts that look blocked: either the account the persisted global block
+ * points at, or an account whose last error is a ban/suspension error.
+ * Matches are deduplicated so one account is reported once.
+ */
+function findBlockedAccounts() {
+  const block = accounts.getBlock();
+  const blockId = block?.accountId ? String(block.accountId).toLowerCase() : null;
+  const blockEmail = block?.email ? String(block.email).toLowerCase() : null;
+  const seen = new Set();
+  const matches = [];
+
+  for (const account of accounts.listAccounts()) {
+    const id = String(account.id || '').toLowerCase();
+    const email = String(account.email || '').toLowerCase();
+    const matchesBlock = Boolean(
+      (blockId && (id === blockId || email === blockId)) ||
+        (blockEmail && (email === blockEmail || id === blockEmail))
+    );
+    const banError = accounts.isBanError(account.lastError) ? account.lastError : null;
+    if (!matchesBlock && !banError) continue;
+    if (seen.has(account.id)) continue;
+    seen.add(account.id);
+    matches.push({
+      account,
+      reason: banError || block?.message || block?.reason || 'ban/suspension error',
+    });
+  }
+
+  return { block, matches };
+}
+
+function cmdBlocked() {
+  const { block, matches } = findBlockedAccounts();
+  if (!matches.length) {
+    console.log('No blocked accounts found.');
+  } else {
+    console.log(`Blocked accounts (${matches.length}):`);
+    for (const { account, reason } of matches) {
+      console.log(`- ${account.email || account.id}`);
+      console.log(`  reason: ${reason}`);
+    }
+  }
+  if (block) {
+    console.log(
+      `\nPersisted global block: ${block.email || block.accountId || '?'} since ${block.at} (${
+        block.message || block.reason || 'ban/suspension error'
+      }).`
+    );
+    console.log('Clear it after resolving the accounts with: npm run accounts -- remove-blocked');
+  }
+}
+
+function cmdRemoveBlocked() {
+  const { block, matches } = findBlockedAccounts();
+
+  if (!matches.length) {
+    if (!block) {
+      console.log('No blocked accounts found. Nothing to remove.');
+      return;
+    }
+    accounts.unblockAll();
+    console.log(
+      `No matching account records. Cleared the stale global block (was ${
+        block.email || block.accountId || '?'
+      } since ${block.at}).`
+    );
+    console.log('No accounts were removed.');
+    return;
+  }
+
+  for (const { account, reason } of matches) {
+    try {
+      const removed = accounts.removeAccount(account.id);
+      console.log(`Removed from vault: ${removed.email || removed.id} (keyring unchanged)`);
+      console.log(`  reason: ${reason}`);
+    } catch (err) {
+      console.log(`Could not remove ${account.email || account.id}: ${err.message}`);
+    }
+  }
+
+  if (block) {
+    accounts.unblockAll();
+    console.log('\nCleared the persisted global block so remaining accounts can be attempted again.');
+  }
+}
+
 function cmdUnblock() {
   const previous = accounts.unblockAll();
   if (!previous) {
@@ -291,6 +378,10 @@ If Google rejects an account for a ban/suspension, the provider blocks all
 accounts and stops attempts. After resolving it, unlock with:
    npm run accounts -- unblock
 
+To inspect or clean up banned accounts:
+   npm run accounts -- blocked          # list accounts matching the block or a ban error
+   npm run accounts -- remove-blocked   # remove those accounts and clear the global block
+
 The provider uses the entire vault and switches accounts automatically when
 quota runs out. The agy keyring only changes when you run "use".`);
 }
@@ -302,6 +393,8 @@ quota runs out. The agy keyring only changes when you run "use".`);
     if (cmd === 'use') return await cmdUse(rest[0]);
     if (cmd === 'remove' || cmd === 'rm') return cmdRemove(rest[0]);
     if (cmd === 'unblock' || cmd === 'reset-block') return cmdUnblock();
+    if (cmd === 'blocked') return cmdBlocked();
+    if (cmd === 'remove-blocked') return cmdRemoveBlocked();
     if (cmd === 'quota') return await cmdQuota();
     if (cmd === 'login') return cmdLogin();
     if (cmd === 'list' || cmd === 'ls') {
