@@ -626,7 +626,34 @@ function pushAccountEvent(event) {
     console.warn(`[agy] troca de conta (${full.model}): ${from} -> ${to} [${full.reason}]`);
   } else if (full.type === 'recovered') {
     console.warn(`[agy] conta liberada (${full.model}): voltando para ${to}`);
+  } else if (full.type === 'blocked') {
+    console.error(
+      `\x1b[31m[agy] BLOQUEIO: ${from || 'conta'} recusada pelo Google (${full.statusCode || '?'}); todas as contas foram paradas.\x1b[0m`
+    );
   }
+}
+
+function blockedMessage() {
+  const block = accounts.getBlock();
+  const who = block?.email || block?.accountId || 'uma conta';
+  const detail = block?.message ? ` Detalhe: ${block.message}` : '';
+  return [
+    `BLOQUEIO DE SEGURANÇA: o Google recusou ${who} por possível banimento, suspensão ou violação de termos.${detail}`,
+    'O provider parou de usar TODAS as contas e não fará novas tentativas.',
+    'Resolva a situação com o Google e depois rode: npm run accounts -- unblock',
+  ].join(' ');
+}
+
+function emitBlockedEvent({ block, accountId, modelId, statusCode, message }) {
+  pushAccountEvent({
+    type: 'blocked',
+    model: modelId,
+    reason: 'ban',
+    statusCode: statusCode || null,
+    message: String(message || '').slice(0, 1000),
+    account: accountSnapshot(accountId, modelId),
+    blocked: block,
+  });
 }
 
 async function refreshSnapshots(ids) {
@@ -681,12 +708,22 @@ async function postWithAccounts(body, modelId) {
   let last = null;
   let pendingSwitch = null;
 
+  if (accounts.isBlocked()) {
+    return { statusCode: 403, text: blockedMessage() };
+  }
+
   while (true) {
+    if (accounts.isBlocked()) {
+      return { statusCode: 403, text: blockedMessage() };
+    }
     const account = accounts.selectAccountsFor(modelId).find((a) => !tried.has(a.id));
     if (!account) break;
     tried.add(account.id);
 
     for (let attempt = 1; attempt <= 2; attempt++) {
+      if (accounts.isBlocked()) {
+        return { statusCode: 403, text: blockedMessage() };
+      }
       const out = await callAccount(body, account);
 
       if (out.ok) {
@@ -722,6 +759,24 @@ async function postWithAccounts(body, modelId) {
           pendingSwitch = { fromId: account.id, reason: 'error', message: out.networkError };
         }
         break;
+      }
+
+      // Banimento/suspensão: para tudo na hora, sem tentar outra conta.
+      if (accounts.isBanError(out.text)) {
+        const block = accounts.blockAll({
+          accountId: account.id,
+          modelId,
+          statusCode: out.statusCode,
+          message: out.text.slice(0, 1000),
+        });
+        emitBlockedEvent({
+          block,
+          accountId: account.id,
+          modelId,
+          statusCode: out.statusCode,
+          message: out.text,
+        });
+        return { statusCode: 403, text: blockedMessage() };
       }
 
       if (out.invalid) {
@@ -808,6 +863,7 @@ function parseCloudEvents(stream, onEvent, onDone, onError) {
   };
 
   stream.on('data', (chunk) => {
+    if (finished) return;
     buffer += decoder.write(chunk);
     let idx;
     while ((idx = buffer.indexOf('\n')) >= 0) {
@@ -819,7 +875,10 @@ function parseCloudEvents(stream, onEvent, onDone, onError) {
       let parsed;
       try { parsed = JSON.parse(raw); } catch { continue; }
       if (parsed.error) {
-        onError(new Error(parsed.error.message || JSON.stringify(parsed.error)));
+        const err = new Error(parsed.error.message || JSON.stringify(parsed.error));
+        err.rawText = JSON.stringify(parsed.error || parsed);
+        finished = true;
+        onError(err);
         return;
       }
       const body = parsed.response || parsed;
@@ -915,6 +974,38 @@ function chunkBase(id, model) {
     created: Math.floor(Date.now() / 1000),
     model,
   };
+}
+
+function handleStreamFailure(err, res, modelId, account) {
+  const raw = err.rawText || err.message || String(err);
+  if (accounts.isBanError(raw)) {
+    const block = accounts.blockAll({
+      accountId: account?.id,
+      modelId,
+      statusCode: 200,
+      message: raw.slice(0, 1000),
+    });
+    emitBlockedEvent({
+      block,
+      accountId: account?.id,
+      modelId,
+      statusCode: 200,
+      message: raw,
+    });
+    const message = blockedMessage();
+    if (!res.headersSent) {
+      sendJson(res, 403, openAiError(message, 403, 'account_blocked'));
+    } else {
+      res.write(`data: ${JSON.stringify(openAiError(message, 403, 'account_blocked'))}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+    return true;
+  }
+
+  if (!res.headersSent) sendJson(res, 502, openAiError(err.message, 502));
+  else res.end();
+  return false;
 }
 
 async function handleChat(req, res, payload) {
@@ -1014,8 +1105,7 @@ async function handleChat(req, res, payload) {
         });
       },
       (err) => {
-        if (!res.headersSent) sendJson(res, 502, openAiError(err.message, 502));
-        else res.end();
+        handleStreamFailure(err, res, model.id, result.account);
       }
     );
     return;
@@ -1083,9 +1173,9 @@ async function handleChat(req, res, payload) {
       res.end();
     },
     (err) => {
-      res.write(`data: ${JSON.stringify(openAiError(err.message, 502))}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+      if (handleStreamFailure(err, res, model.id, result.account)) {
+        upstream.destroy();
+      }
     }
   );
 }
@@ -1099,6 +1189,7 @@ const server = http.createServer((req, res) => {
       ok: true,
       provider: 'provider-agy',
       version: VERSION,
+      blocked: accounts.getBlock(),
       accounts: list.map((a) => ({
         email: a.email,
         project: a.project,
@@ -1111,7 +1202,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && (url.pathname === '/v1/accounts' || url.pathname === '/accounts')) {
-    sendJson(res, 200, { object: 'list', data: accounts.publicList() });
+    sendJson(res, 200, {
+      object: 'list',
+      blocked: accounts.getBlock(),
+      data: accounts.publicList(),
+    });
     return;
   }
 
@@ -1170,6 +1265,13 @@ server.listen(PORT, HOST, () => {
   // projeto/quota de todas as contas em background, sem bloquear o boot
   accounts.bootstrap().then(
     async () => {
+      const block = accounts.getBlock();
+      if (block) {
+        console.error(
+          `\x1b[31m[agy] contas bloqueadas desde ${block.at} (${block.email || block.accountId || '?'}): nenhuma tentativa será feita. Rode: npm run accounts -- unblock\x1b[0m`
+        );
+        return;
+      }
       const list = accounts.listAccounts();
       console.log(`cofre: ${list.length} conta(s) [${list.map((a) => a.email || a.id).join(', ')}]`);
       for (const account of list) {

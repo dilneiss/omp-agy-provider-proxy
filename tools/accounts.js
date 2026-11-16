@@ -31,6 +31,16 @@ function quotaSummary(account) {
 }
 
 function printList() {
+  const block = accounts.getBlock();
+  if (block) {
+    console.log('\x1b[31m' + '='.repeat(70));
+    console.log('CONTAS BLOQUEADAS — o provider parou de fazer novas tentativas');
+    console.log(`Conta: ${block.email || block.accountId || '?'} | modelo: ${block.modelId || '?'}`);
+    console.log(`Motivo: ${block.message || 'erro de banimento/suspensão'}`);
+    console.log(`Desde: ${new Date(block.at).toLocaleString('pt-BR')}`);
+    console.log('Resolva com o Google e rode: npm run accounts -- unblock');
+    console.log('='.repeat(70) + '\x1b[0m');
+  }
   const list = accounts.publicList();
   if (!list.length) {
     console.log('Nenhuma conta no cofre. Rode: npm run accounts -- add');
@@ -104,6 +114,16 @@ function cmdRemove(query) {
   console.log(`Removida do cofre: ${account.email || account.id} (o keyring não foi alterado)`);
 }
 
+function cmdUnblock() {
+  const previous = accounts.unblockAll();
+  if (!previous) {
+    console.log('As contas não estavam bloqueadas.');
+    return;
+  }
+  console.log(`Bloqueio removido (era ${previous.email || previous.accountId || '?'} desde ${previous.at}).`);
+  console.log('O provider volta a tentar as contas na próxima requisição.');
+}
+
 function cmdLogin() {
   console.log(`Fluxo para adicionar outra conta sem perder as atuais:
 
@@ -122,6 +142,10 @@ function cmdLogin() {
 5. Para o agy abrir com uma conta específica:
    npm run accounts -- use <email-ou-índice>
 
+Se o Google recusar uma conta por banimento/suspensão, o provider bloqueia
+todas as contas e para as tentativas. Depois de resolver, libere com:
+   npm run accounts -- unblock
+
 O provider usa o cofre inteiro e troca de conta sozinho quando a quota de
 uma acaba. O keyring do agy só muda quando você roda "use".`);
 }
@@ -132,6 +156,7 @@ uma acaba. O keyring do agy só muda quando você roda "use".`);
     if (cmd === 'add') return await cmdAdd(rest[0]);
     if (cmd === 'use') return await cmdUse(rest[0]);
     if (cmd === 'remove' || cmd === 'rm') return cmdRemove(rest[0]);
+    if (cmd === 'unblock' || cmd === 'reset-block') return cmdUnblock();
     if (cmd === 'quota') return await cmdQuota();
     if (cmd === 'login') return cmdLogin();
     if (cmd === 'list' || cmd === 'ls') {

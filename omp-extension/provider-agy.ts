@@ -76,7 +76,30 @@ function when(value) {
   return new Date(ms).toLocaleString("pt-BR");
 }
 
+export function formatBlocked(block) {
+  if (!block) return null;
+  return [
+    "🛑 BLOQUEIO DE CONTAS — provider parado",
+    `Conta: ${block.email || block.accountId || "?"}`,
+    `Motivo: ${block.message || "possível banimento/suspensão"}`,
+    `Desde: ${when(block.at)}`,
+    "Nenhuma conta será tentada. Resolva a situação com o Google e rode:",
+    "npm run accounts -- unblock",
+  ].join("\n");
+}
+
 export function formatEvent(event) {
+  if (event.type === "blocked") {
+    return formatBlocked(
+      event.blocked || {
+        email: event.account?.email,
+        accountId: event.account?.id,
+        message: event.message,
+        at: event.at,
+      }
+    );
+  }
+
   if (event.type === "recovered") {
     const to = event.to || {};
     return [
@@ -110,6 +133,17 @@ export default function providerAgy(pi) {
   let polling = false;
   let seq = -1;
 
+  async function notifyBlockedState(ctx) {
+    if (!ctx.hasUI) return;
+    try {
+      const res = await fetch(`${BASE}/v1/accounts`, { signal: AbortSignal.timeout(1500) });
+      if (!res.ok) return;
+      const data = await res.json();
+      const text = formatBlocked(data.blocked);
+      if (text) ctx.ui.notify(text, "error");
+    } catch {}
+  }
+
   async function initCursor() {
     try {
       const res = await fetch(`${BASE}/v1/accounts/events?since=-1`, {
@@ -138,7 +172,8 @@ export default function providerAgy(pi) {
         if (Number.isFinite(event.seq)) seq = Math.max(seq, event.seq);
         const text = formatEvent(event);
         if (text && ctx.hasUI) {
-          ctx.ui.notify(text, event.type === "recovered" ? "info" : "warning");
+          const level = event.type === "blocked" ? "error" : event.type === "recovered" ? "info" : "warning";
+          ctx.ui.notify(text, level);
         }
       }
       if (Number.isFinite(data.lastSeq)) seq = Math.max(seq, data.lastSeq);
@@ -164,6 +199,7 @@ export default function providerAgy(pi) {
       ctx.ui.notify("provider-agy iniciado automaticamente em segundo plano", "info");
     }
     await initCursor();
+    await notifyBlockedState(ctx);
     timer = setInterval(() => poll(ctx), POLL_MS);
   });
 

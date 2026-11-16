@@ -218,6 +218,7 @@ O comando é idempotente: importar a mesma conta de novo atualiza o token dela e
 | `npm run accounts -- add [nome]` | importa a conta logada no `agy` para o cofre |
 | `npm run accounts -- use <email-ou-índice>` | faz o `agy` usar essa conta (grava o blob no keyring) |
 | `npm run accounts -- remove <email-ou-índice>` | remove do cofre sem mexer no keyring |
+| `npm run accounts -- unblock` | libera o provider depois de um bloqueio por banimento/suspensão |
 | `npm run accounts -- quota` | consulta a quota real de cada conta e modelo |
 | `npm run accounts -- login` | mostra o passo a passo acima |
 | `npm run quota` | atalho de diagnóstico de quota usando o cofre inteiro |
@@ -265,6 +266,35 @@ curl http://127.0.0.1:8788/health
 curl http://127.0.0.1:8788/v1/accounts
 ```
 
+### Banimento, suspensão e bloqueio global
+
+O provider valida os erros do Cloud Code (tanto HTTP quanto eventos SSE) antes de tentar outra conta. Se a mensagem indicar banimento, suspensão, conta desativada, violação de termos ou abuso, ele:
+
+- **para imediatamente** a requisição e **não tenta nenhuma outra conta**;
+- grava o bloqueio em `~/.provider-agy/accounts.json`, então ele sobrevive a reinícios do provider;
+- registra um evento `blocked` e a extensão mostra um aviso em **vermelho** (`error`) na TUI do omp;
+- passa a responder `403` em todas as novas requisições, sem chamar o Google.
+
+Exemplo do aviso:
+
+```text
+🛑 BLOQUEIO DE CONTAS — provider parado
+Conta: conta-a@exemplo.com
+Motivo: Your account has been suspended for violating the Terms of Service
+Desde: 16/11/2026, 00:21
+Nenhuma conta será tentada. Resolva a situação com o Google e rode:
+npm run accounts -- unblock
+```
+
+Depois de resolver com o Google, libere manualmente:
+
+```bash
+npm run accounts -- unblock
+npm run accounts -- list
+```
+
+O estado também aparece em `GET /health` e `GET /v1/accounts` no campo `blocked` (ou `null`). Erros de quota, 429 por entrada grande e bloqueios de safety do modelo **não** disparam esse bloqueio — só padrões de banimento/suspensão/violação.
+
 ### Avisos de troca de conta no omp
 
 A extensão consulta `GET /v1/accounts/events` a cada 2 segundos e mostra uma notificação na TUI quando a conta muda. Exemplo:
@@ -284,7 +314,7 @@ Modelo: claude-sonnet-4-6
 Quota atual: 100% restante | reset: 16/11/2026 05:20
 ```
 
-O motivo pode ser `quota`, `invalid` (token/conta recusados) ou `error` (falha temporária). As quotas do aviso são atualizadas no momento da troca; se a consulta falhar, aparece a última leitura conhecida ou “sem leitura”. Os avisos aparecem apenas em sessões interativas do omp; em `-p`/RPC eles não são exibidos.
+O motivo pode ser `quota`, `invalid` (token/conta recusados), `error` (falha temporária) ou `blocked` (banimento/suspensão, mostrado em vermelho). As quotas do aviso são atualizadas no momento da troca; se a consulta falhar, aparece a última leitura conhecida ou “sem leitura”. Os avisos aparecem apenas em sessões interativas do omp; em `-p`/RPC eles não são exibidos. Ao abrir uma sessão com o provider já bloqueado, a extensão mostra o aviso vermelho na hora.
 
 O mesmo histórico fica disponível para qualquer cliente:
 
@@ -392,6 +422,7 @@ Fluxos validados neste projeto:
 - fallback automático quando a conta ativa está inválida;
 - evento de troca de conta com conta anterior, motivo, reset e quota da conta nova;
 - retorno prioritário à conta anterior depois do horário de reset;
+- bloqueio global imediato ao detectar banimento/suspensão, sem tentar outra conta, com aviso vermelho e `unblock` manual;
 - início automático do provider pela extensão do omp, inclusive com o servidor parado (`omp -p` respondeu sem `npm start`);
 - resposta 429 com horário de reset quando todas as contas estão sem quota para o modelo.
 
@@ -404,6 +435,8 @@ Fluxos validados neste projeto:
 | `invalid_grant` em uma conta | refresh token revogado/expirado | faça login de novo no `agy` e rode `npm run accounts -- add` |
 | `429 QUOTA_EXHAUSTED` | quota do modelo esgotada | aguarde o `resetTime` ou adicione outra conta ao cofre |
 | `429` sem detalhes, em prompt grande | limite de entrada por requisição (~40k tokens) | reduza `AGY_MAX_INPUT_TOKENS`, remova skills/MCP ou diminua o contexto |
+| aviso vermelho de contas bloqueadas | o Google recusou uma conta por banimento/suspensão | resolva com o Google e rode `npm run accounts -- unblock` |
+| `403 BLOQUEIO DE SEGURANÇA` em toda requisição | bloqueio global ativo no cofre | `npm run accounts -- list` e, após resolver, `npm run accounts -- unblock` |
 | `nenhuma conta disponível` | cofre vazio ou todas inválidas | `npm run accounts -- list` e `npm run accounts -- add` |
 | porta 8788 ocupada | outro provider/processo rodando | pare o processo ou use `AGY_PROVIDER_PORT=8790` |
 | provider não sobe sozinho no omp | extensão não instalada ou caminho antigo | rode `npm run install:omp` e reinicie o omp |
