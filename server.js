@@ -893,14 +893,46 @@ async function postWithAccounts(body, modelId) {
 
       if (out.statusCode === 429) {
         const quota = accounts.parseQuotaExhaustion(out.text);
-        if (!quota.isQuota) {
-          // Per-request limit (for example, a large Gemini input): switching
-          // accounts would not help and would burn the others.
+        let isQuota = quota.isQuota;
+        let resetAt = quota.resetAt;
+
+        // Cloud Code usually answers with a bare 429 "Resource has been
+        // exhausted (e.g. check quota)" and no details, which is identical for
+        // account quota and for a per-request limit. Ask the account's quota
+        // endpoint before deciding, otherwise a real quota exhaustion is
+        // returned to the client instead of switching accounts.
+        if (!isQuota && quota.ambiguous) {
+          const state = await accounts.quotaStateFor(account, modelId);
+          const known = state && state.remainingFraction != null;
+          if (known && state.remainingFraction > 0) {
+            // Quota is still available: this is a per-request limit, so
+            // switching accounts would not help and would burn the others.
+            console.warn(
+              `[agy] 429 on ${account.email} for ${modelId} ignored: quota still at ${Math.round(
+                state.remainingFraction * 100
+              )}%`
+            );
+            return { statusCode: 429, headers: out.headers, text: out.text };
+          }
+          isQuota = true;
+          // Without a reliable reset, park the account briefly so a stale
+          // per-request error cannot take it out for an hour.
+          resetAt =
+            resetAt ||
+            state?.resetTime ||
+            new Date(Date.now() + 5 * 60 * 1000).toISOString();
+          console.warn(
+            `[agy] 429 on ${account.email} for ${modelId} confirmed as quota exhaustion (reset ${resetAt})`
+          );
+        }
+
+        if (!isQuota) {
+          // Per-request limit that is not about the account's quota.
           return { statusCode: 429, headers: out.headers, text: out.text };
         }
-        accounts.markExhausted(account.id, modelId, quota.resetAt, quota.message);
+        accounts.markExhausted(account.id, modelId, resetAt, quota.message);
         console.warn(
-          `[agy] quota for ${modelId} exhausted on ${account.email} (reset ${quota.resetAt}); trying next account`
+          `[agy] quota for ${modelId} exhausted on ${account.email} (reset ${resetAt}); trying next account`
         );
         if (!pendingSwitch) {
           pendingSwitch = { fromId: account.id, reason: 'quota', message: quota.message };
