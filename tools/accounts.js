@@ -52,6 +52,7 @@ function printList() {
     const invalid = a.invalid ? ' [inválida]' : '';
     console.log(`${active} ${i + 1}. ${a.email || a.id}${invalid}`);
     console.log(`     projeto: ${a.project}`);
+    if (a.requestCount) console.log(`     requisições: ${a.requestCount}`);
     if (a.lastError) console.log(`     erro: ${a.lastError}`);
     const summary = quotaSummary(a);
     if (summary) console.log(`     quota: ${summary}`);

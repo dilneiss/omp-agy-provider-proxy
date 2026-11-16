@@ -324,6 +324,26 @@ curl 'http://127.0.0.1:8788/v1/accounts/events?since=0'
 curl 'http://127.0.0.1:8788/v1/accounts/events?since=-1'
 ```
 
+### Status periódico da conta
+
+A cada **10 requisições bem-sucedidas**, o provider atualiza a quota e emite um evento `status`. A extensão mostra um banner de acompanhamento:
+
+```text
+📊 provider-agy — status da conta (10 requisições)
+Conta: conta-a@exemplo.com
+Modelo: gemini-3.8-flash-high
+Quota: 83% restante | reset: 16/11/2026, 04:20
+Requisições nesta conta: 42
+```
+
+O contador é por processo do provider; `Requisições nesta conta` é o total acumulado daquela conta no cofre. Para mudar o intervalo (por exemplo, para testar a cada 1):
+
+```bash
+AGY_STATUS_EVERY=1 npm start
+```
+
+O padrão é `10`. O status também aparece no log do provider e em `GET /v1/accounts/events`.
+
 ### Cofre e segurança dos tokens
 
 - Arquivo: `~/.provider-agy/accounts.json` (ou `AGY_STATE_DIR/accounts.json`).
@@ -378,6 +398,7 @@ omp --model agy/claude-sonnet-4-6 --no-skills --no-rules --no-context-files --no
 | `AGY_PROVIDER_HOST` | `127.0.0.1` | endereço local do servidor |
 | `AGY_PROVIDER_PORT` | `8788` | porta local |
 | `AGY_PROVIDER_URL` | `http://127.0.0.1:8788` | URL usada pela extensão do omp |
+| `AGY_STATUS_EVERY` | `10` | intervalo de requisições para o banner de status da conta |
 | `AGY_PROVIDER_DIR` | lido de `~/.provider-agy/config.json` | pasta do provider que a extensão deve iniciar |
 | `AGY_NODE` | `node` | executável usado pela extensão para subir o servidor |
 | `AGY_MAX_INPUT_TOKENS` | `38000` | orçamento de tokens de entrada por requisição |
@@ -423,6 +444,8 @@ Fluxos validados neste projeto:
 - evento de troca de conta com conta anterior, motivo, reset e quota da conta nova;
 - retorno prioritário à conta anterior depois do horário de reset;
 - bloqueio global imediato ao detectar banimento/suspensão, sem tentar outra conta, com aviso vermelho e `unblock` manual;
+- banner periódico de status da conta a cada 10 requisições, com quota e reset atualizados;
+- nenhuma janela de terminal visível: keyring e `icacls` rodam ocultos, e o `icacls` não é repetido a cada gravação;
 - início automático do provider pela extensão do omp, inclusive com o servidor parado (`omp -p` respondeu sem `npm start`);
 - resposta 429 com horário de reset quando todas as contas estão sem quota para o modelo.
 
@@ -442,6 +465,7 @@ Fluxos validados neste projeto:
 | provider não sobe sozinho no omp | extensão não instalada ou caminho antigo | rode `npm run install:omp` e reinicie o omp |
 | aviso de troca não aparece | sessão `-p`/RPC ou extensão não carregada | use a TUI e confira `/extensions` no omp |
 | extensão instalada mas servidor não encontra | projeto movido/renomeado | rode `npm run install:omp` de novo |
+| janelas de terminal piscando a cada request | versão antiga rodando `icacls` em cada save | reinicie o provider na versão atual; os subprocessos agora são ocultos e o `icacls` roda no máximo uma vez por arquivo |
 
 Para parar um processo antigo na porta (Windows):
 

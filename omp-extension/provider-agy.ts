@@ -88,7 +88,20 @@ export function formatBlocked(block) {
   ].join("\n");
 }
 
+export function formatStatus(event) {
+  const account = event.account || {};
+  return [
+    `📊 provider-agy — status da conta (${event.requests} requisições)`,
+    `Conta: ${account.email || account.id || "?"}`,
+    `Modelo: ${event.model}`,
+    `Quota: ${pct(account.remainingFraction)} | reset: ${when(account.resetTime)}`,
+    `Requisições nesta conta: ${event.accountRequests ?? "?"}`,
+  ].join("\n");
+}
+
 export function formatEvent(event) {
+  if (event.type === "status") return formatStatus(event);
+
   if (event.type === "blocked") {
     return formatBlocked(
       event.blocked || {
@@ -172,7 +185,12 @@ export default function providerAgy(pi) {
         if (Number.isFinite(event.seq)) seq = Math.max(seq, event.seq);
         const text = formatEvent(event);
         if (text && ctx.hasUI) {
-          const level = event.type === "blocked" ? "error" : event.type === "recovered" ? "info" : "warning";
+          const level =
+            event.type === "blocked"
+              ? "error"
+              : event.type === "status" || event.type === "recovered"
+                ? "info"
+                : "warning";
           ctx.ui.notify(text, level);
         }
       }

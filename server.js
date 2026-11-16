@@ -597,7 +597,11 @@ async function callAccount(body, account) {
 
 const accountEvents = [];
 let accountEventSeq = 0;
+let servedRequests = 0;
 const MAX_ACCOUNT_EVENTS = 100;
+const rawStatusEvery = Number(process.env.AGY_STATUS_EVERY || 10);
+const STATUS_EVERY =
+  Number.isFinite(rawStatusEvery) && rawStatusEvery > 0 ? Math.floor(rawStatusEvery) : 10;
 
 function accountSnapshot(id, modelId) {
   const account = accounts.findAccount(id);
@@ -620,8 +624,8 @@ function pushAccountEvent(event) {
   accountEvents.push(full);
   if (accountEvents.length > MAX_ACCOUNT_EVENTS) accountEvents.shift();
 
-  const from = full.from?.email || '?';
-  const to = full.to?.email || '?';
+  const from = full.from?.email || full.account?.email || '?';
+  const to = full.to?.email || full.account?.email || '?';
   if (full.type === 'switch') {
     console.warn(`[agy] troca de conta (${full.model}): ${from} -> ${to} [${full.reason}]`);
   } else if (full.type === 'recovered') {
@@ -629,6 +633,10 @@ function pushAccountEvent(event) {
   } else if (full.type === 'blocked') {
     console.error(
       `\x1b[31m[agy] BLOQUEIO: ${from || 'conta'} recusada pelo Google (${full.statusCode || '?'}); todas as contas foram paradas.\x1b[0m`
+    );
+  } else if (full.type === 'status') {
+    console.log(
+      `[agy] status (${full.requests} requisições): ${to} | ${full.account?.remainingFraction != null ? Math.round(full.account.remainingFraction * 100) + '% restante' : 'sem leitura'}`
     );
   }
 }
@@ -642,6 +650,25 @@ function blockedMessage() {
     'O provider parou de usar TODAS as contas e não fará novas tentativas.',
     'Resolva a situação com o Google e depois rode: npm run accounts -- unblock',
   ].join(' ');
+}
+
+async function emitStatusEvent({ accountId, modelId }) {
+  try {
+    const account = accounts.findAccount(accountId);
+    if (!account) return;
+    try { await accounts.refreshAccountMeta(account); } catch {}
+    pushAccountEvent({
+      type: 'status',
+      model: modelId,
+      reason: 'periodic',
+      requests: servedRequests,
+      interval: STATUS_EVERY,
+      accountRequests: account.requestCount || 0,
+      account: accountSnapshot(accountId, modelId),
+    });
+  } catch (err) {
+    console.warn(`[agy] falha ao registrar status periódico: ${err.message}`);
+  }
 }
 
 function emitBlockedEvent({ block, accountId, modelId, statusCode, message }) {
@@ -728,6 +755,10 @@ async function postWithAccounts(body, modelId) {
 
       if (out.ok) {
         const info = accounts.markSuccess(account.id, modelId);
+        servedRequests += 1;
+        if (servedRequests % STATUS_EVERY === 0) {
+          void emitStatusEvent({ accountId: account.id, modelId });
+        }
         if (pendingSwitch && pendingSwitch.fromId !== account.id) {
           void emitSwitchEvent({ ...pendingSwitch, toId: account.id, modelId });
         } else if (info.recovered && info.previousActive !== account.id) {
