@@ -338,45 +338,98 @@ function isUserTextEntry(entry) {
   );
 }
 
-function trimToBudget(body) {
-  if (process.env.AGY_TRIM === '0' || !MAX_INPUT_TOKENS) return { body, trimmedTokens: 0, droppedTurns: 0 };
-  const original = estimateTokens(body);
-  if (original <= MAX_INPUT_TOKENS) return { body, trimmedTokens: 0, droppedTurns: 0 };
+const PART_TRUNCATE_CHARS = Number(process.env.AGY_PART_TRUNCATE_CHARS || 8000);
 
-  let droppedTurns = 0;
-  // remove whole old turns (never split functionCall from functionResponse)
-  while (estimateTokens(body) > MAX_INPUT_TOKENS) {
-    const contents = body.request.contents;
-    let first = -1;
-    let second = -1;
-    for (let i = 0; i < contents.length; i++) {
-      if (!isUserTextEntry(contents[i])) continue;
-      if (first === -1) first = i;
-      else { second = i; break; }
-    }
-    if (second <= 0) break;
-    contents.splice(0, second);
-    droppedTurns++;
-  }
-
-  let trimmedTokens = 0;
-  if (estimateTokens(body) > MAX_INPUT_TOKENS) {
-    const sys = body.request.systemInstruction?.parts?.[0];
-    if (sys && typeof sys.text === 'string') {
-      const excessTokens = estimateTokens(body) - MAX_INPUT_TOKENS;
-      const cutChars = Math.ceil(excessTokens * CHARS_PER_TOKEN);
-      const keep = Math.max(20000, sys.text.length - cutChars);
-      if (keep < sys.text.length) {
-        const before = sys.text.length;
-        sys.text =
-          sys.text.slice(0, keep) +
-          '\n\n[... skills/MCP catalog truncated by provider-agy to fit the backend context limit ...]';
-        trimmedTokens = before - keep;
+/**
+ * Truncates the oldest oversized part below `limit` entries and returns whether
+ * it changed anything. Only text and functionResponse payloads are touched: a
+ * functionCall carries the thoughtSignature pairing, so it is never rewritten.
+ */
+function shrinkOldestOversizedPart(contents, limit) {
+  const stop = Math.min(limit, contents.length);
+  for (let i = 0; i < stop; i++) {
+    for (const part of contents[i].parts || []) {
+      if (typeof part.text === 'string' && part.text.length > PART_TRUNCATE_CHARS) {
+        part.text = `${part.text.slice(0, PART_TRUNCATE_CHARS)}\n[... truncated by provider-agy to fit the backend context limit ...]`;
+        return true;
+      }
+      if (part.functionResponse) {
+        const payload = JSON.stringify(part.functionResponse.response ?? '');
+        if (payload.length > PART_TRUNCATE_CHARS) {
+          part.functionResponse.response = {
+            truncated: true,
+            originalChars: payload.length,
+            note: 'tool output truncated by provider-agy to fit the backend context limit',
+          };
+          return true;
+        }
       }
     }
   }
+  return false;
+}
 
-  return { body, trimmedTokens, droppedTurns };
+function trimToBudget(body) {
+  if (process.env.AGY_TRIM === '0' || !MAX_INPUT_TOKENS) {
+    return { body, trimmedTokens: 0, droppedTurns: 0, truncatedParts: 0, estimate: estimateTokens(body) };
+  }
+  const estimate = () => estimateTokens(body);
+  if (estimate() <= MAX_INPUT_TOKENS) {
+    return { body, trimmedTokens: 0, droppedTurns: 0, truncatedParts: 0, estimate: estimate() };
+  }
+
+  const contents = body.request.contents;
+  let droppedTurns = 0;
+  // 1) Drop the oldest whole turns. A turn starts at a user text entry and is
+  // never split, so a functionCall keeps its functionResponse.
+  while (estimate() > MAX_INPUT_TOKENS) {
+    const boundaries = [];
+    for (let i = 0; i < contents.length; i++) {
+      if (isUserTextEntry(contents[i])) boundaries.push(i);
+    }
+    if (boundaries.length < 2 || boundaries[1] <= 0) break;
+    contents.splice(0, boundaries[1]);
+    droppedTurns++;
+  }
+
+  // 2) Shrink the system prompt (skills/MCP catalog).
+  let trimmedTokens = 0;
+  const sys = body.request.systemInstruction?.parts?.[0];
+  if (sys && typeof sys.text === 'string' && estimate() > MAX_INPUT_TOKENS) {
+    const cutChars = Math.ceil((estimate() - MAX_INPUT_TOKENS) * CHARS_PER_TOKEN);
+    const keep = Math.max(20000, sys.text.length - cutChars);
+    if (keep < sys.text.length) {
+      const before = sys.text.length;
+      sys.text = `${sys.text.slice(0, keep)}\n\n[... catalog truncated by provider-agy to fit the backend context limit ...]`;
+      trimmedTokens = before - keep;
+    }
+  }
+
+  // 3) Last resort: a single tool result can be larger than the whole budget
+  // and no turn boundary saves us. Truncate the oldest oversized payloads,
+  // preferring anything older than the current turn.
+  let truncatedParts = 0;
+  while (estimate() > MAX_INPUT_TOKENS) {
+    if (shrinkOldestOversizedPart(contents, contents.length - 1)) {
+      truncatedParts++;
+      continue;
+    }
+    if (shrinkOldestOversizedPart(contents, contents.length)) {
+      truncatedParts++;
+      continue;
+    }
+    // Nothing else left to shrink: cut the system prompt past its normal floor
+    // so the request never leaves over budget.
+    if (sys && typeof sys.text === 'string' && sys.text.length > 2000) {
+      const target = Math.max(2000, Math.floor(sys.text.length / 2));
+      trimmedTokens += sys.text.length - target;
+      sys.text = `${sys.text.slice(0, target)}\n[... truncated by provider-agy to fit the backend context limit ...]`;
+      continue;
+    }
+    break;
+  }
+
+  return { body, trimmedTokens, droppedTurns, truncatedParts, estimate: estimate() };
 }
 
 function buildCloudRequest(openaiReq, project = PROJECT) {
@@ -502,9 +555,14 @@ function buildCloudRequest(openaiReq, project = PROJECT) {
     requestType: 'agent',
   };
   const fitted = trimToBudget(body);
-  if (fitted.trimmedTokens || fitted.droppedTurns) {
+  if (fitted.trimmedTokens || fitted.droppedTurns || fitted.truncatedParts) {
     console.warn(
-      `[agy] context trimmed: ${fitted.trimmedTokens} system chars and ${fitted.droppedTurns} old turn(s) removed (limit ~${MAX_INPUT_TOKENS} tokens)`
+      `[agy] context trimmed: ${fitted.trimmedTokens} system chars, ${fitted.droppedTurns} old turn(s), ${fitted.truncatedParts} oversized part(s) (limit ~${MAX_INPUT_TOKENS} tokens)`
+    );
+  }
+  if (fitted.estimate > MAX_INPUT_TOKENS) {
+    console.warn(
+      `[agy] context still over budget after trimming: ~${fitted.estimate} tokens > ${MAX_INPUT_TOKENS}; the backend may reject this request`
     );
   }
   return { model, body: fitted.body };

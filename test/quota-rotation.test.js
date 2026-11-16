@@ -232,5 +232,32 @@ test('large OMP system prompts are trimmed below the backend context limit', () 
 
   const systemText = body.request.systemInstruction.parts[0].text;
   assert.ok(systemText.length < prompt.length, 'oversized OMP system content must be trimmed');
-  assert.ok(systemText.includes('skills/MCP catalog truncated by provider-agy'));
+  assert.ok(systemText.includes('truncated by provider-agy'));
+});
+
+test('a huge tool-result history is reduced under the budget', () => {
+  // One user turn followed by large tool results: there is no second turn
+  // boundary, so only payload truncation can bring this under the limit. This
+  // is the shape that reached the backend at ~167k tokens and got a 429.
+  const messages = [{ role: 'user', content: 'leia os arquivos' }];
+  for (let i = 0; i < 30; i++) {
+    messages.push({ role: 'tool', tool_call_id: `call_${i}`, name: 'read', content: 'y'.repeat(60_000) });
+  }
+
+  const { body } = buildCloudRequest({ model: MODEL, messages });
+  const bytes = Buffer.byteLength(JSON.stringify(body));
+  assert.ok(bytes < 200_000, `the request must shrink, got ${bytes} bytes`);
+
+  const serialized = JSON.stringify(body);
+  assert.ok(serialized.includes('"truncated":true'), 'oversized tool payloads must be truncated');
+});
+
+test('a small request is sent unchanged', () => {
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'user', content: 'responda OK' }],
+  });
+
+  assert.equal(body.request.contents.length, 1);
+  assert.equal(body.request.contents[0].parts[0].text, 'responda OK');
 });
