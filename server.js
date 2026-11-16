@@ -446,16 +446,95 @@ function stripSchemaDescriptions(body) {
 }
 
 /**
+ * Cloud Code requires alternating turns: a functionCall turn must follow a user
+ * or functionResponse turn. Dropping history can leave two turns of the same
+ * role adjacent, so merge them and never start on an orphan response.
+ */
+function normalizeContents(contents) {
+  for (;;) {
+    let merged = false;
+    for (let i = 1; i < contents.length; i++) {
+      if (contents[i].role === contents[i - 1].role) {
+        contents[i - 1].parts = [...(contents[i - 1].parts || []), ...(contents[i].parts || [])];
+        contents.splice(i, 1);
+        merged = true;
+        break;
+      }
+    }
+    if (merged) continue;
+    if (contents.length <= 1) return;
+    const head = contents[0];
+    const parts = head.parts || [];
+    // A functionResponse needs its call right before it, and a functionCall
+    // needs a user turn right before it; neither can open the history.
+    const invalidHead =
+      parts.some((part) => part.functionResponse) ||
+      (head.role === 'model' && parts.some((part) => part.functionCall));
+    if (!invalidHead) return;
+    contents.shift();
+  }
+}
+
+/**
+ * Indexes where a turn can safely begin: a user turn carrying text. Starting a
+ * history anywhere else is what makes Cloud Code reject a functionCall turn or
+ * an orphan functionResponse.
+ */
+function turnStartIndexes(contents) {
+  const starts = [];
+  for (let i = 0; i < contents.length; i++) {
+    const entry = contents[i];
+    const parts = entry.parts || [];
+    const hasText = parts.some((part) => typeof part.text === 'string');
+    const hasResponse = parts.some((part) => part.functionResponse);
+    if (entry.role === 'user' && hasText && !hasResponse) starts.push(i);
+  }
+  return starts;
+}
+
+/**
+ * Removes inline images from every turn except the last. In a long agentic
+ * loop the only user turn holds the pasted screenshots, so they dominate a body
+ * that has no turn boundary left to drop; the current turn keeps its images.
+ */
+function stripOldImages(contents) {
+  let removed = 0;
+  for (let i = 0; i < contents.length - 1; i++) {
+    const entry = contents[i];
+    const parts = entry.parts || [];
+    for (let j = parts.length - 1; j >= 0; j--) {
+      if (parts[j].inlineData) {
+        parts.splice(j, 1);
+        removed++;
+      }
+    }
+    if (removed && !parts.length) {
+      entry.parts = [{ text: '[image removed by provider-agy to fit the context limit]' }];
+    }
+  }
+  return removed > 0;
+}
+
+/** Drops the oldest complete turn, preserving call/response pairing. */
+function dropOldestTurn(contents) {
+  const starts = turnStartIndexes(contents);
+  const next = starts.find((index) => index > 0);
+  if (next === undefined) return false;
+  contents.splice(0, next);
+  return true;
+}
+
+/**
  * Truncates the oldest oversized part below `limit` entries and returns whether
  * it changed anything. Only text and functionResponse payloads are touched: a
  * functionCall carries the thoughtSignature pairing, so it is never rewritten.
  */
-function shrinkOldestOversizedPart(contents, limit) {
+function shrinkOldestOversizedPart(contents, limit, maxChars = PART_TRUNCATE_CHARS) {
   const stop = Math.min(limit, contents.length);
   for (let i = 0; i < stop; i++) {
     for (const part of contents[i].parts || []) {
-      if (typeof part.text === 'string' && part.text.length > PART_TRUNCATE_CHARS) {
-        const keep = Math.max(0, PART_TRUNCATE_CHARS - SYSTEM_MARKER.length);
+      if (typeof part.text === 'string' && part.text.length > maxChars) {
+        const keep = Math.max(0, Math.floor(maxChars / 2) - SYSTEM_MARKER.length);
         const next = `${part.text.slice(0, keep)}${SYSTEM_MARKER}`;
         if (next.length >= part.text.length) continue;
         part.text = next;
@@ -463,7 +542,7 @@ function shrinkOldestOversizedPart(contents, limit) {
       }
       if (part.functionResponse) {
         const payload = JSON.stringify(part.functionResponse.response ?? '');
-        if (payload.length > PART_TRUNCATE_CHARS) {
+        if (payload.length > maxChars) {
           part.functionResponse.response = {
             truncated: true,
             originalChars: payload.length,
@@ -521,13 +600,10 @@ function trimToBudget(body) {
   // loop.
   let truncatedParts = 0;
   let iterations = 0;
+  let partLimit = PART_TRUNCATE_CHARS;
   while (estimate() > MAX_INPUT_TOKENS && iterations < MAX_TRIM_ITERATIONS) {
     iterations++;
-    if (shrinkOldestOversizedPart(contents, contents.length - 1)) {
-      truncatedParts++;
-      continue;
-    }
-    if (shrinkOldestOversizedPart(contents, contents.length)) {
+    if (shrinkOldestOversizedPart(contents, contents.length, partLimit)) {
       truncatedParts++;
       continue;
     }
@@ -540,6 +616,12 @@ function trimToBudget(body) {
       truncatedParts += strippedDescriptions;
       continue;
     }
+    // Nothing above the current threshold is left, so lower it: payloads of a
+    // few kilobytes each add up to more than the budget.
+    if (partLimit > 500) {
+      partLimit = Math.max(500, Math.floor(partLimit / 2));
+      continue;
+    }
     if (sys && typeof sys.text === 'string' && sys.text.length > SYSTEM_FLOOR_CHARS) {
       const target = Math.max(SYSTEM_FLOOR_CHARS, Math.floor(sys.text.length / 2));
       const next =
@@ -549,6 +631,17 @@ function trimToBudget(body) {
       if (next.length >= sys.text.length) break;
       trimmedTokens += sys.text.length - next.length;
       sys.text = next;
+      continue;
+    }
+    // Pasted screenshots in an old turn can dwarf everything shrinkable.
+    if (stripOldImages(contents)) {
+      truncatedParts++;
+      continue;
+    }
+    // Everything shrinkable is exhausted: drop the oldest complete turn,
+    // images and all, until the body fits.
+    if (dropOldestTurn(contents)) {
+      droppedTurns++;
       continue;
     }
     break;
@@ -684,6 +777,9 @@ function buildCloudRequest(openaiReq, project = PROJECT) {
     requestType: 'agent',
   };
   const fitted = trimToBudget(body);
+  // Dropped tool calls can leave an invalid opening or adjacent same-role
+  // turns even when the body fits, so normalize regardless of trimming.
+  normalizeContents(body.request.contents);
   if (fitted.trimmedTokens || fitted.droppedTurns || fitted.truncatedParts) {
     console.warn(
       `[agy] context trimmed: ${fitted.trimmedTokens} system chars, ${fitted.droppedTurns} old turn(s), ${fitted.truncatedParts} oversized part(s) (limit ~${MAX_INPUT_TOKENS} tokens)`

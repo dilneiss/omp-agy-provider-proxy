@@ -332,6 +332,34 @@ test('a request far beyond the hard limit still fails locally', () => {
   }), /hard limit/);
 });
 
+test('old screenshots are dropped when they alone exceed the budget', () => {
+  const image = { type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(120_000)}` } };
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'veja' }, ...Array.from({ length: 20 }, () => image)] },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: 'continue' },
+  ];
+  const { body } = buildCloudRequest({ model: MODEL, messages });
+  const images = body.request.contents.flatMap((entry) => entry.parts || []).filter((part) => part.inlineData);
+  assert.equal(images.length, 0, 'old screenshots must be replaced to fit the budget');
+});
+
+test('a history that would open with a tool call is normalized', () => {
+  // The provider drops tool calls whose thoughtSignature it never stored, which
+  // can leave a functionCall or an orphan response as the first turn.
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', name: 'read', content: 'resultado' },
+      { role: 'user', content: 'continue' },
+    ],
+  });
+  const first = body.request.contents[0];
+  assert.equal(first.role, 'user');
+  assert.ok(!(first.parts || []).some((part) => part.functionCall || part.functionResponse));
+});
+
 test('an AI-agent self-identification is neutralized before forwarding', () => {
   // Cloud Code answers a bare 429 RESOURCE_EXHAUSTED for this exact sentence,
   // which made every account look exhausted while quota was intact.
