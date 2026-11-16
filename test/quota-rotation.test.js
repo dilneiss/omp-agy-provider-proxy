@@ -311,7 +311,17 @@ test('large nested tool parameter descriptions shrink without changing the schem
   assert.ok(Math.ceil(JSON.stringify(body).length / 3.5) <= 30_000);
 });
 
-test('irreducible oversized tool schemas fail locally instead of rotating accounts', () => {
+test('a request above the soft budget but below the hard limit is sent, not rejected', () => {
+  // The soft budget is a trimming target; only gross overages are worth failing.
+  const messages = [{ role: 'user', content: 'x'.repeat(80_000) }, { role: 'tool', tool_call_id: 'a', name: 'read', content: 'y'.repeat(30_000) }];
+  let built;
+  assert.doesNotThrow(() => {
+    built = buildCloudRequest({ model: MODEL, messages });
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(built.body)) > 0);
+});
+
+test('a request far beyond the hard limit still fails locally', () => {
   assert.throws(() => buildCloudRequest({
     model: MODEL,
     messages: [{ role: 'user', content: 'continue' }],
@@ -319,7 +329,7 @@ test('irreducible oversized tool schemas fail locally instead of rotating accoun
       name: 'choose',
       parameters: { type: 'string', enum: ['x'.repeat(550_000)] },
     } }],
-  }), /context exceeds provider budget/);
+  }), /hard limit/);
 });
 
 test('an AI-agent self-identification is neutralized before forwarding', () => {

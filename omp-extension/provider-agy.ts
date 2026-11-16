@@ -548,6 +548,7 @@ export default function providerAgy(pi) {
   let limitsAt = 0;
   let compacting = false;
   let lastCompactAt = 0;
+  let compactionUnavailable = false;
 
   async function providerLimits() {
     if (limits && Date.now() - limitsAt < 60_000) return limits;
@@ -567,7 +568,7 @@ export default function providerAgy(pi) {
   }
 
   async function maybeCompact(ctx) {
-    if (compacting) return;
+    if (compacting || compactionUnavailable) return;
     // A compaction leaves the session idle for a while; do not stack them.
     if (lastCompactAt && Date.now() - lastCompactAt < 60_000) return;
 
@@ -596,8 +597,16 @@ export default function providerAgy(pi) {
       }
       await ctx.compact();
     } catch (err) {
+      const message = String(err?.message ?? err ?? "");
+      // "Nothing to compact" means omp has no summarizable history in this
+      // session: retrying on every turn only spams the transcript.
+      if (/nothing to compact/i.test(message)) {
+        compactionUnavailable = true;
+        logLine(`compaction unavailable for this session: ${message}`);
+        return;
+      }
       if (ctx.hasUI) {
-        ctx.ui.notify(`Automatic compaction failed: ${err?.message ?? err}`, "error");
+        ctx.ui.notify(`Automatic compaction failed: ${message}`, "error");
       }
     } finally {
       compacting = false;

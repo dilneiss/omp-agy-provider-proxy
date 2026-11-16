@@ -689,11 +689,21 @@ function buildCloudRequest(openaiReq, project = PROJECT) {
       `[agy] context trimmed: ${fitted.trimmedTokens} system chars, ${fitted.droppedTurns} old turn(s), ${fitted.truncatedParts} oversized part(s) (limit ~${MAX_INPUT_TOKENS} tokens)`
     );
   }
-  if (process.env.AGY_TRIM !== '0' && MAX_INPUT_TOKENS > 0 && fitted.estimate > MAX_INPUT_TOKENS) {
-    const size = (value) => Buffer.byteLength(JSON.stringify(value ?? null));
-    const sizes = `system=${size(body.request.systemInstruction)} contents=${size(body.request.contents)} tools=${size(body.request.tools)}`;
-    console.warn(`[agy] context exceeds budget after trimming: estimate=${fitted.estimate} limit=${MAX_INPUT_TOKENS} bytes ${sizes}`);
-    throw new Error(`context exceeds provider budget after trimming (~${fitted.estimate}/${MAX_INPUT_TOKENS} tokens); compact the session or reduce tool schemas`);
+  // The soft budget drives trimming; only a request far beyond what the backend
+  // accepts is worth failing locally. Measured ceiling: ~33.5k real tokens pass.
+  const hardLimit = Number(process.env.AGY_HARD_INPUT_TOKENS || Math.round(MAX_INPUT_TOKENS * 1.6));
+  if (process.env.AGY_TRIM !== '0' && MAX_INPUT_TOKENS > 0 && fitted.estimate > hardLimit) {
+    console.warn(
+      `[agy] context still over the hard limit after trimming: estimate=${fitted.estimate} hard=${hardLimit} soft=${MAX_INPUT_TOKENS}`
+    );
+    throw new Error(
+      `context exceeds the provider hard limit after trimming (~${fitted.estimate}/${hardLimit} tokens); reduce tool output or start a new session`
+    );
+  }
+  if (fitted.estimate > MAX_INPUT_TOKENS) {
+    console.warn(
+      `[agy] sending above the soft budget after trimming: estimate=${fitted.estimate} soft=${MAX_INPUT_TOKENS}`
+    );
   }
   return { model, body: fitted.body };
 }

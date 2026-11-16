@@ -103,6 +103,30 @@ test('a provider without the limits route never compacts', async () => {
   assert.equal(session.compactionCount(), 0);
 });
 
+test('a session with nothing to compact is not asked again', async () => {
+  stubProvider();
+  const handlers = {};
+  const notifications = [];
+  let attempts = 0;
+  providerAgy({ on: (name, handler) => (handlers[name] = handler) });
+  const ctx = {
+    hasUI: true,
+    ui: { notify: (text, level) => notifications.push({ text, level }) },
+    getContextUsage: () => ({ tokens: 29000 }),
+    compact: async () => {
+      attempts += 1;
+      throw new Error('Compaction failed: Nothing to compact (session too small)');
+    },
+  };
+
+  await handlers.turn_end({}, ctx);
+  await handlers.turn_end({}, ctx);
+  await handlers.turn_end({}, ctx);
+
+  assert.equal(attempts, 1, 'a session that cannot compact must not be retried every turn');
+  assert.ok(!notifications.some((n) => n.level === 'error'), 'the failure is not worth an error notice');
+});
+
 test('a provider running older files is restarted, a matching one is kept', () => {
   assert.equal(providerNeedsRestart('abc123', 'abc123'), false);
   assert.equal(providerNeedsRestart('abc123', 'def456'), true);
