@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +33,12 @@ function providerDir() {
   return path.resolve(HERE, "..");
 }
 
+function delay(ms) {
+  const { promise, resolve } = Promise.withResolvers();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
 async function isUp() {
   try {
     const res = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(1200) });
@@ -41,8 +48,73 @@ async function isUp() {
   }
 }
 
+/** Same derivation as the provider: sha256(server.js + lib/accounts.js)[0..12]. */
+function localBuild(dir) {
+  try {
+    const hash = crypto.createHash("sha256");
+    hash.update(fs.readFileSync(path.join(dir, "server.js")));
+    hash.update(fs.readFileSync(path.join(dir, "lib", "accounts.js")));
+    return hash.digest("hex").slice(0, 12);
+  } catch {
+    return "unknown";
+  }
+}
 
+async function runningBuild() {
+  try {
+    const res = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(1200) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return typeof data.build === "string" ? data.build : null;
+  } catch {
+    return null;
+  }
+}
+
+async function shutdownProvider() {
+  try {
+    await fetch(`${BASE}/v1/shutdown`, { method: "POST", signal: AbortSignal.timeout(1500) });
+  } catch {}
+  for (let i = 0; i < 25; i++) {
+    await delay(200);
+    if (!(await isUp())) return true;
+  }
+  return !(await isUp());
+}
+
+/**
+ * True when the provider answering on the port was started from different
+ * files than the ones on disk. A provider that reports no build at all predates
+ * this handshake, so it counts as stale too. An unreadable local build is not a
+ * reason to stop anything.
+ */
+export function providerNeedsRestart(actual, expected) {
+  if (!expected || expected === "unknown") return false;
+  return actual !== expected;
+}
+
+async function ensureProvider() {
   const dir = providerDir();
+  const expected = localBuild(dir);
+
+  if (await isUp()) {
+    const actual = await runningBuild();
+    if (!providerNeedsRestart(actual, expected)) {
+      return { ok: true, started: false };
+    }
+    await shutdownProvider();
+    if (await isUp()) {
+      return {
+        ok: false,
+        started: false,
+        stale: true,
+        error:
+          "a provider started from older code is still running and did not stop on its own; " +
+          "stop the node process on the provider port and restart omp",
+      };
+    }
+  }
+
   if (!fs.existsSync(path.join(dir, "server.js"))) {
     return { ok: false, error: `server not found in ${dir}` };
   }
@@ -57,7 +129,7 @@ async function isUp() {
   child.unref();
 
   for (let i = 0; i < 30; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await delay(200);
     if (await isUp()) return { ok: true, started: true };
   }
   return { ok: false, error: "the server did not respond within 6s" };
