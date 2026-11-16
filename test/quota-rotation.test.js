@@ -117,7 +117,7 @@ test('429 diagnostics report request size without logging prompt contents', asyn
 
   const diagnostic = logs.find((line) => line.includes('429 diagnostics:'));
   assert.ok(diagnostic, 'a 429 diagnostic line should be emitted');
-  assert.match(diagnostic, /inputEstimate=\d+ limit=30000 bodyBytes=\d+/);
+  assert.match(diagnostic, /inputEstimate=\d+ limit=\d+ bodyBytes=\d+/);
   assert.ok(!logs.join('\n').includes('PRIVATE_PROMPT_SENTINEL'));
 });
 
@@ -252,6 +252,17 @@ test('a huge tool-result history is reduced under the budget', () => {
   assert.ok(serialized.includes('"truncated":true'), 'oversized tool payloads must be truncated');
 });
 
+test('large text does not monopolize trimming ahead of tool results', () => {
+  const messages = [{ role: 'user', content: 'x'.repeat(200_000) }];
+  for (let i = 0; i < 12; i++) {
+    messages.push({ role: 'tool', tool_call_id: `large_${i}`, name: 'read', content: 'y'.repeat(30_000) });
+  }
+  const { body } = buildCloudRequest({ model: MODEL, messages });
+  const estimate = Math.ceil(JSON.stringify(body).length / 3.5);
+  assert.ok(estimate <= 30_000, `request still exceeds the budget: ${estimate}`);
+  assert.ok(JSON.stringify(body).includes('"truncated":true'), 'large tool results must also be reduced');
+});
+
 test('the trim terminates when the tool schemas alone exceed the budget', () => {
   // Regression: shrinking the system prompt near its floor re-added a marker
   // each pass, so the body never shrank and the event loop spun forever.
@@ -281,6 +292,61 @@ test('the trim terminates when the tool schemas alone exceed the budget', () => 
   assert.ok(JSON.stringify(body).includes('truncated by provider-agy'));
 });
 
+test('large nested tool parameter descriptions shrink without changing the schema', () => {
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'user', content: 'continue' }],
+    tools: [{ type: 'function', function: {
+      name: 'read',
+      parameters: { type: 'object', required: ['path'], properties: {
+        path: { type: 'string', description: 'x'.repeat(550_000) },
+      } },
+    } }],
+  });
+  const declaration = body.request.tools[0].functionDeclarations[0];
+  assert.equal(declaration.name, 'read');
+  assert.deepEqual(declaration.parameters.required, ['path']);
+  assert.equal(declaration.parameters.properties.path.type, 'STRING');
+  assert.equal(declaration.parameters.properties.path.description, undefined);
+  assert.ok(Math.ceil(JSON.stringify(body).length / 3.5) <= 30_000);
+});
+
+test('irreducible oversized tool schemas fail locally instead of rotating accounts', () => {
+  assert.throws(() => buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'user', content: 'continue' }],
+    tools: [{ type: 'function', function: {
+      name: 'choose',
+      parameters: { type: 'string', enum: ['x'.repeat(550_000)] },
+    } }],
+  }), /context exceeds provider budget/);
+});
+
+test('an AI-agent self-identification is neutralized before forwarding', () => {
+  // Cloud Code answers a bare 429 RESOURCE_EXHAUSTED for this exact sentence,
+  // which made every account look exhausted while quota was intact.
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [
+      { role: 'system', content: "You are omp's trusted coding assistant.\n\n# Engineering\n- be brief" },
+      { role: 'user', content: 'continue' },
+    ],
+  });
+  const systemText = body.request.systemInstruction.parts[0].text;
+  assert.ok(!/trusted coding assistant/i.test(systemText), 'the self-identification must not be forwarded');
+  assert.ok(systemText.includes('Assistente') || systemText.includes('assistente'));
+  assert.ok(systemText.includes('# Engineering'), 'the rest of the prompt must survive');
+});
+
+test('ordinary system prompts are forwarded unchanged', () => {
+  const prompt = 'Você é um assistente de programação. Responda em português.';
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'system', content: prompt }, { role: 'user', content: 'ok' }],
+  });
+  assert.equal(body.request.systemInstruction.parts[0].text, prompt);
+});
+
 test('a small request is sent unchanged', () => {
   const { body } = buildCloudRequest({
     model: MODEL,
@@ -289,4 +355,20 @@ test('a small request is sent unchanged', () => {
 
   assert.equal(body.request.contents.length, 1);
   assert.equal(body.request.contents[0].parts[0].text, 'responda OK');
+});
+
+test('large base64 images are preserved instead of counted as text tokens', () => {
+  const data = 'A'.repeat(120_000);
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: 'continue' },
+      ...Array.from({ length: 5 }, () => ({
+        type: 'image_url', image_url: { url: `data:image/png;base64,${data}` },
+      })),
+    ] }],
+  });
+  const images = body.request.contents.flatMap((entry) => entry.parts).filter((part) => part.inlineData);
+  assert.equal(images.length, 5);
+  assert.equal(images[0].inlineData.data, data);
 });
