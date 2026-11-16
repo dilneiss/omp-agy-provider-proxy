@@ -358,10 +358,81 @@ function levelFor(event) {
   return "warning";
 }
 
+/**
+ * True when the session sits at or above the provider's compaction threshold.
+ * Kept pure so the trigger can be tested without an omp session.
+ */
+export function shouldCompact(tokens, budget) {
+  if (!budget || !Number.isFinite(budget.maxInputTokens) || budget.maxInputTokens <= 0) return false;
+  if (!Number.isFinite(tokens) || tokens <= 0) return false;
+  const percent = Number.isFinite(budget.compactAtPercent) ? budget.compactAtPercent : 80;
+  return tokens >= budget.maxInputTokens * (percent / 100);
+}
+
 export default function providerAgy(pi) {
   let timer = null;
   let polling = false;
   let seq = -1;
+
+  // Auto-compaction. The provider enforces a budget much smaller than the
+  // model's advertised window, so the client's own accounting never reaches
+  // its threshold. Ask the provider for the real budget and compact the
+  // session once it is this close.
+  let limits = null;
+  let limitsAt = 0;
+  let compacting = false;
+  let lastCompactAt = 0;
+
+  async function providerLimits() {
+    if (limits && Date.now() - limitsAt < 60_000) return limits;
+    try {
+      const res = await fetch(`${BASE}/v1/limits`, { signal: AbortSignal.timeout(1500) });
+      if (!res.ok) return limits;
+      const data = await res.json();
+      if (Number.isFinite(data.maxInputTokens) && data.maxInputTokens > 0) {
+        limits = {
+          maxInputTokens: data.maxInputTokens,
+          compactAtPercent: Number.isFinite(data.compactAtPercent) ? data.compactAtPercent : 80,
+        };
+        limitsAt = Date.now();
+      }
+    } catch {}
+    return limits;
+  }
+
+  async function maybeCompact(ctx) {
+    if (compacting) return;
+    // A compaction leaves the session idle for a while; do not stack them.
+    if (lastCompactAt && Date.now() - lastCompactAt < 60_000) return;
+
+    const budget = await providerLimits();
+    if (!budget) return;
+
+    const usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : null;
+    const tokens = Number(usage?.tokens);
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+
+    if (!shouldCompact(tokens, budget)) return;
+
+    compacting = true;
+    lastCompactAt = Date.now();
+    const percent = Math.round((tokens / budget.maxInputTokens) * 100);
+    try {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `Provider context at ${percent}% of ${budget.maxInputTokens} tokens (threshold ${budget.compactAtPercent}%); compacting automatically`,
+          "warning"
+        );
+      }
+      await ctx.compact();
+    } catch (err) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Automatic compaction failed: ${err?.message ?? err}`, "error");
+      }
+    } finally {
+      compacting = false;
+    }
+  }
 
   async function notifyBlockedState(ctx) {
     if (!ctx.hasUI) return;
@@ -410,6 +481,11 @@ export default function providerAgy(pi) {
       polling = false;
     }
   }
+
+  // Compaction cannot run mid-turn, so the check happens once the turn ends.
+  pi.on("turn_end", async (_event, ctx) => {
+    await maybeCompact(ctx);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     const result = await ensureProvider();

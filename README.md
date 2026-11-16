@@ -348,11 +348,29 @@ Context window, input limit, and quota are different limits:
 
 The ~40k limit is a practical route/plan ceiling, not the model context window. A full omp prompt with many skills and MCP entries can exceed it.
 
-To fit the route, the provider applies a conservative input budget (`AGY_MAX_INPUT_TOKENS`, default **38,000**):
+To fit the route, the provider enforces an input budget (`AGY_MAX_INPUT_TOKENS`, default **30,000**) and always measures the final body:
 
 - removes whole old turns without splitting `functionCall`/`functionResponse`;
 - if needed, truncates the **tail** of the system prompt (skills/MCP catalog) while preserving the main instructions at the beginning;
-- logs the adjustment and continues.
+- if that is still not enough — the usual case for a long history of tool results — truncates the oldest oversized `functionResponse`/text payloads (`AGY_PART_TRUNCATE_CHARS`, default 8000 chars each);
+- keeps cutting the system prompt past its 20k floor until the body is under budget, and logs `context still over budget` if anything escapes.
+
+Measured: the backend accepts ~35k and ~75k real prompt tokens and rejects ~167k, so the budget keeps a wide margin.
+
+### Automatic compaction at 80%
+
+The client's own accounting uses the advertised model window (1M), so it never approaches a ratio that would make it compact. The extension closes that gap:
+
+- the provider reports its real budget at `GET /v1/limits`;
+- after each turn (`turn_end`) the extension compares `ctx.getContextUsage().tokens` against `maxInputTokens`;
+- at or above `AGY_COMPACT_AT_PERCENT` (default **80**) it notifies and calls `ctx.compact()`, with a 60s cooldown so compactions never stack.
+
+```bash
+curl http://127.0.0.1:8788/v1/limits
+# {"maxInputTokens":30000,"compactAtPercent":80,"truncatePartChars":8000,"trim":"on"}
+```
+
+Raise the budget only as far as the backend actually accepts for your accounts.
 
 If you do not need every skill or MCP server, this also keeps prompts smaller:
 

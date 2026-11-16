@@ -325,6 +325,13 @@ function rememberToolCall(id, name, signature) {
 const MAX_INPUT_TOKENS = Number(process.env.AGY_MAX_INPUT_TOKENS || 30000);
 const CHARS_PER_TOKEN = 3.5;
 
+// The client compacts on its own schedule; this is the point where the
+// provider's real budget is close enough that a growing session must shrink.
+const COMPACT_AT_PERCENT = Math.min(
+  95,
+  Math.max(50, Number(process.env.AGY_COMPACT_AT_PERCENT || 80))
+);
+
 function estimateTokens(obj) {
   return Math.ceil(JSON.stringify(obj).length / CHARS_PER_TOKEN);
 }
@@ -1772,6 +1779,19 @@ const server = http.createServer((req, res) => {
       ? accountEvents.filter((event) => event.seq > since)
       : [];
     sendJson(res, 200, { object: 'list', lastSeq: accountEventSeq, data });
+    return;
+  }
+
+  if (req.method === 'GET' && (url.pathname === '/v1/limits' || url.pathname === '/limits')) {
+    // The backend rejects oversized bodies, so the real budget is far smaller
+    // than the model's advertised window. The omp extension reads this to
+    // compact before a request gets close to the edge.
+    sendJson(res, 200, {
+      maxInputTokens: MAX_INPUT_TOKENS,
+      compactAtPercent: COMPACT_AT_PERCENT,
+      truncatePartChars: PART_TRUNCATE_CHARS,
+      trim: process.env.AGY_TRIM === '0' ? 'off' : 'on',
+    });
     return;
   }
 
