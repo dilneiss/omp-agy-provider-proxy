@@ -710,6 +710,10 @@ function pushAccountEvent(event) {
     console.error(
       `\x1b[31m[agy] BLOCK: ${from || 'account'} rejected by Google (${full.statusCode || '?'}); all accounts have been stopped.\x1b[0m`
     );
+  } else if (full.type === 'usage') {
+    console.warn(
+      `[agy] all accounts failed for ${full.model} (${full.reason}); reported usage of ${full.accounts?.length || 0} account(s)`
+    );
   } else if (full.type === 'status') {
     console.log(
       `[agy] status (${full.requests} requests): ${to} | ${full.account?.remainingFraction != null ? Math.round(full.account.remainingFraction * 100) + '% remaining' : 'no reading'} | ${full.window?.totalTokens || 0} tokens in window`
@@ -801,6 +805,181 @@ async function emitRecoveredEvent({ accountId, previousActive, modelId }) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Quota pause: stop when every account is spent, resume on the first reset
+// ---------------------------------------------------------------------------
+
+function retryAfterSeconds(resetAt) {
+  const ms = Date.parse(resetAt || '') - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return 60;
+  return Math.max(1, Math.ceil(ms / 1000));
+}
+
+/** Wait the backend asked for, taken from the header or the RetryInfo delay. */
+function retryAfterMs(headers, text) {
+  const header = Number(headers?.['retry-after']);
+  if (Number.isFinite(header) && header > 0) return header * 1000;
+  try {
+    const details = JSON.parse(text)?.error?.details;
+    const retry = Array.isArray(details)
+      ? details.find((d) => String(d?.['@type'] || '').includes('RetryInfo'))
+      : null;
+    const delay = retry?.retryDelay;
+    if (typeof delay === 'string') {
+      const m = delay.match(/^(\d+(?:\.\d+)?)s$/);
+      if (m) return Number(m[1]) * 1000;
+    }
+  } catch {}
+  return 0;
+}
+
+/**
+ * Refreshes every account and reports the usage of the selected model, so the
+ * "all accounts failed" notices show real numbers from the whole vault.
+ */
+const reportThrottle = new Map();
+
+async function accountUsageReport(modelId) {
+  for (const account of accounts.listAccounts()) {
+    try { await accounts.refreshAccountMeta(account); } catch {}
+  }
+  return accounts.publicList().map((account) => {
+    const q = account.quota?.[modelId] || {};
+    return {
+      id: account.id,
+      email: account.email || account.id,
+      active: account.active,
+      invalid: account.invalid,
+      remainingFraction: q.remainingFraction ?? null,
+      resetTime: q.exhaustedUntil || q.resetTime || null,
+      cooldownUntil: q.cooldownUntil || null,
+      requestCount: account.requestCount || 0,
+      lastError: account.lastError || null,
+    };
+  });
+}
+
+async function reportAllAccounts({ modelId, reason, message, force = false }) {
+  const last = reportThrottle.get(modelId) || 0;
+  if (!force && Date.now() - last < 60_000) return null;
+  reportThrottle.set(modelId, Date.now());
+  const list = await accountUsageReport(modelId);
+  pushAccountEvent({
+    type: 'usage',
+    model: modelId,
+    reason: reason || 'all-failed',
+    message: message ? String(message).slice(0, 500) : null,
+    accounts: list,
+  });
+  return list;
+}
+
+function pausedMessage(pause) {
+  const model = pause?.modelId ? ` for ${pause.modelId}` : '';
+  const until = pause?.nextResetAt ? new Date(pause.nextResetAt).toISOString() : 'an unknown time';
+  return [
+    `QUOTA PAUSE: every account in the vault is out of quota${model}.`,
+    `The provider stopped making upstream attempts and resumes at ${until}.`,
+  ].join(' ');
+}
+
+let pauseTimer = null;
+let pauseCheckRunning = false;
+
+function schedulePauseWake() {
+  if (pauseTimer) {
+    clearTimeout(pauseTimer);
+    pauseTimer = null;
+  }
+  const now = Date.now();
+  let next = null;
+  for (const pause of accounts.listPauses()) {
+    const ms = Date.parse(pause.nextResetAt || '') || 0;
+    if (ms > now && (next == null || ms < next)) next = ms;
+  }
+  if (next == null) return;
+  const delay = Math.max(1000, Math.min(next - now + 2000, 60 * 60 * 1000));
+  pauseTimer = setTimeout(() => {
+    pauseTimer = null;
+    void checkPauses();
+  }, delay);
+  if (pauseTimer.unref) pauseTimer.unref();
+}
+
+/**
+ * Wakes at the earliest reset, verifies the released account against the live
+ * quota and, when it is usable again, lifts the pause and notifies the client
+ * (the omp extension turns this event into a UI notice).
+ */
+async function checkPauses() {
+  if (pauseCheckRunning) return;
+  pauseCheckRunning = true;
+  try {
+    const now = Date.now();
+    for (const pause of accounts.listPauses()) {
+      const until = Date.parse(pause.nextResetAt || '') || 0;
+      if (until > now) continue;
+
+      const account = accounts.selectAccountsFor(pause.modelId)[0];
+      if (!account) {
+        // Nothing released yet: wait for the next known reset, or retry soon.
+        const upcoming = Date.parse(accounts.nextResetFor(pause.modelId) || '') || 0;
+        accounts.setPause(pause.modelId, {
+          ...pause,
+          nextResetAt: new Date(Math.max(upcoming, now + 5 * 60 * 1000)).toISOString(),
+        });
+        continue;
+      }
+
+      accounts.clearPause(pause.modelId);
+      try { await accounts.refreshAccountMeta(account); } catch {}
+      try { accounts.setActive(account.id); } catch {}
+      pushAccountEvent({
+        type: 'resumed',
+        model: pause.modelId,
+        reason: 'reset',
+        message: `quota reset; provider resumed on ${account.email || account.id}`,
+        account: accountSnapshot(account.id, pause.modelId),
+      });
+      console.log(
+        `[agy] RESUMED: ${pause.modelId} available again on ${account.email || account.id}`
+      );
+    }
+  } catch (err) {
+    console.warn(`[agy] quota pause check failed: ${err.message}`);
+  } finally {
+    pauseCheckRunning = false;
+    schedulePauseWake();
+  }
+}
+
+async function pauseForQuota(modelId, nextResetAt, message) {
+  const before = accounts.getPause(modelId);
+  const pause = accounts.setPause(modelId, { nextResetAt, reason: 'quota', message });
+  if (!before) {
+    // Show where every account stands on the selected model before pausing.
+    const list = await accountUsageReport(modelId);
+    pushAccountEvent({
+      type: 'paused',
+      model: modelId,
+      reason: 'quota',
+      message: message ? String(message).slice(0, 500) : null,
+      pause,
+      accounts: list,
+    });
+    console.warn(
+      `[agy] PAUSED: every account is out of quota for ${modelId}; resuming at ${pause.nextResetAt}`
+    );
+    for (const account of list) {
+      console.warn(
+        `[agy]   ${account.email}: ${account.remainingFraction == null ? '?' : Math.round(account.remainingFraction * 100) + '%'} remaining, reset ${account.resetTime || '-'}`
+      );
+    }
+  }
+  schedulePauseWake();
+  return pause;
+}
+
 /**
  * Tries vault accounts in preference order. On a quota 429, marks the account
  * exhausted for that model and moves to the next one. A generic 429 (request
@@ -815,6 +994,16 @@ async function postWithAccounts(body, modelId) {
 
   if (accounts.isBlocked()) {
     return { statusCode: 403, text: blockedMessage() };
+  }
+
+  // Parked until the first account resets: no upstream attempt is made at all.
+  const pause = accounts.getPause(modelId);
+  if (pause) {
+    return {
+      statusCode: 429,
+      headers: { 'retry-after': String(retryAfterSeconds(pause.nextResetAt)) },
+      text: pausedMessage(pause),
+    };
   }
 
   while (true) {
@@ -842,6 +1031,7 @@ async function postWithAccounts(body, modelId) {
             modelId,
           });
         }
+        accounts.clearPause(modelId);
         return { res: out.res, account };
       }
 
@@ -895,49 +1085,61 @@ async function postWithAccounts(body, modelId) {
         const quota = accounts.parseQuotaExhaustion(out.text);
         let isQuota = quota.isQuota;
         let resetAt = quota.resetAt;
+        const upstreamDelay = retryAfterMs(out.headers, out.text);
 
         // Cloud Code usually answers with a bare 429 "Resource has been
         // exhausted (e.g. check quota)" and no details, which is identical for
-        // account quota and for a per-request limit. Ask the account's quota
-        // endpoint before deciding, otherwise a real quota exhaustion is
-        // returned to the client instead of switching accounts.
+        // account quota and for a per-account rate limit. Ask the account's
+        // quota endpoint to tell them apart.
         if (!isQuota && quota.ambiguous) {
           const state = await accounts.quotaStateFor(account, modelId);
           const known = state && state.remainingFraction != null;
           if (known && state.remainingFraction > 0) {
-            // Quota is still available: this is a per-request limit, so
-            // switching accounts would not help and would burn the others.
-            console.warn(
-              `[agy] 429 on ${account.email} for ${modelId} ignored: quota still at ${Math.round(
-                state.remainingFraction * 100
-              )}%`
+            // Quota is not spent, so the account itself is refusing requests.
+            // Park it briefly instead of retrying it on every request: the
+            // next attempt must start on another account.
+            const cooldownMs = Math.min(upstreamDelay || 2 * 60 * 1000, 5 * 60 * 1000);
+            accounts.markCooldown(
+              account.id,
+              modelId,
+              new Date(Date.now() + cooldownMs).toISOString(),
+              quota.message
             );
-            return { statusCode: 429, headers: out.headers, text: out.text };
+            console.warn(
+              `[agy] 429 on ${account.email} for ${modelId} with quota at ${Math.round(
+                state.remainingFraction * 100
+              )}%; parked for ${Math.round(cooldownMs / 1000)}s and trying next account`
+            );
+          } else {
+            isQuota = true;
+            resetAt =
+              resetAt ||
+              state?.resetTime ||
+              new Date(Date.now() + (upstreamDelay || 5 * 60 * 1000)).toISOString();
+            console.warn(
+              `[agy] 429 on ${account.email} for ${modelId} confirmed as quota exhaustion (reset ${resetAt})`
+            );
           }
-          isQuota = true;
-          // Without a reliable reset, park the account briefly so a stale
-          // per-request error cannot take it out for an hour.
-          resetAt =
-            resetAt ||
-            state?.resetTime ||
-            new Date(Date.now() + 5 * 60 * 1000).toISOString();
-          console.warn(
-            `[agy] 429 on ${account.email} for ${modelId} confirmed as quota exhaustion (reset ${resetAt})`
-          );
         }
 
-        if (!isQuota) {
-          // Per-request limit that is not about the account's quota.
-          return { statusCode: 429, headers: out.headers, text: out.text };
+        if (isQuota) {
+          accounts.markExhausted(account.id, modelId, resetAt, quota.message);
+          console.warn(
+            `[agy] quota for ${modelId} exhausted on ${account.email} (reset ${resetAt}); trying next account`
+          );
+          if (!pendingSwitch) {
+            pendingSwitch = { fromId: account.id, reason: 'quota', message: quota.message };
+          }
+        } else if (!pendingSwitch) {
+          pendingSwitch = {
+            fromId: account.id,
+            reason: 'error',
+            message: `HTTP 429: ${quota.message}`,
+          };
         }
-        accounts.markExhausted(account.id, modelId, resetAt, quota.message);
-        console.warn(
-          `[agy] quota for ${modelId} exhausted on ${account.email} (reset ${resetAt}); trying next account`
-        );
-        if (!pendingSwitch) {
-          pendingSwitch = { fromId: account.id, reason: 'quota', message: quota.message };
-        }
-        last = { statusCode: 429, text: out.text };
+
+        // A 429 is per account: another account can still serve the request.
+        last = { statusCode: 429, headers: out.headers, text: out.text };
         break;
       }
 
@@ -962,21 +1164,45 @@ async function postWithAccounts(body, modelId) {
   }
 
   const next = accounts.nextResetFor(modelId);
+  if (next) {
+    await pauseForQuota(modelId, next, last?.text || null);
+  } else if (last?.statusCode === 429) {
+    await reportAllAccounts({
+      modelId,
+      reason: 'rate-limited',
+      message: last.text,
+    });
+  }
+  const retryAfter = next
+    ? String(retryAfterSeconds(next))
+    : last?.statusCode === 429
+      ? '30'
+      : null;
+  const headers = retryAfter ? { 'retry-after': retryAfter } : undefined;
   if (last) {
     const suffix = next
       ? last.statusCode === 429
-        ? `\n\nAll vault accounts are out of quota for ${modelId}. Next reset: ${next}.`
+        ? `\n\nAll vault accounts are out of quota for ${modelId}. The provider is paused until ${next}.`
         : `\n\nNo vault account could respond for ${modelId}. Next quota available: ${next}.`
-      : '';
-    return { statusCode: last.statusCode, text: last.text + suffix };
+      : last.statusCode === 429
+        ? `\n\nEvery vault account answered 429 for ${modelId} but their quota still shows availability, so this is a per-account limit rather than exhausted quota. The next request tries another account first.`
+        : '';
+    return { statusCode: last.statusCode, headers, text: last.text + suffix };
   }
+  // No account is selectable right now: either all are out of quota or all are
+  // parked after refusing a request. Both are a 429 with a retry hint, not a
+  // 503, so the client waits instead of treating the provider as broken.
+  const parkedUntil = next || accounts.nextCooldownFor(modelId);
   const err = new Error(
     next
       ? `all vault accounts are out of quota for ${modelId}; next reset at ${next}`
-      : `no account available for ${modelId}`
+      : parkedUntil
+        ? `every account is temporarily parked for ${modelId} after a 429; next attempt at ${parkedUntil}`
+        : `no account available for ${modelId}`
   );
   err.code = 'NO_ACCOUNTS';
-  err.statusCode = next ? 429 : 503;
+  err.statusCode = parkedUntil ? 429 : 503;
+  if (parkedUntil) err.headers = { 'retry-after': String(retryAfterSeconds(parkedUntil)) };
   throw err;
 }
 
@@ -1091,17 +1317,29 @@ function consumePart(part, state) {
 // HTTP server
 // ---------------------------------------------------------------------------
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, headers) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
+    ...(headers || {}),
   });
   res.end(body);
 }
 
 function openAiError(message, status = 500, type = 'api_error') {
   return { error: { message, type, param: null, code: status } };
+}
+
+/** Extracts the readable part of an upstream error, keeping our suffix. */
+function humanError(text) {
+  const value = String(text ?? '');
+  let parsed = null;
+  try { parsed = JSON.parse(value); } catch {}
+  if (parsed?.error?.message) return parsed.error.message;
+  const match = value.match(/"message"\s*:\s*"([^"]+)"/);
+  if (!match) return value || 'Cloud Code failure';
+  return match[1] + value.slice(value.lastIndexOf('"}') + 2);
 }
 
 function chunkBase(id, model) {
@@ -1183,7 +1421,8 @@ async function handleChat(req, res, payload) {
     sendJson(
       res,
       err.statusCode || 502,
-      openAiError(`failed to reach Cloud Code: ${err.message}`, err.statusCode || 502)
+      openAiError(`failed to reach Cloud Code: ${err.message}`, err.statusCode || 502),
+      err.headers
     );
     return;
   }
@@ -1191,12 +1430,14 @@ async function handleChat(req, res, payload) {
   if (!result.res) {
     let text = result.text || 'Cloud Code failure';
     console.error(`[agy] upstream ${result.statusCode}: ${text.slice(0, 800)}`);
-    try {
-      const parsed = JSON.parse(text);
-      text = parsed.error?.message || text;
-    } catch {}
+    text = humanError(text);
     if (!res.headersSent) {
-      sendJson(res, result.statusCode || 502, openAiError(text.slice(0, 2000), result.statusCode || 502));
+      sendJson(
+        res,
+        result.statusCode || 502,
+        openAiError(text.slice(0, 2000), result.statusCode || 502),
+        result.headers
+      );
     }
     return;
   }
@@ -1408,6 +1649,15 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`provider-agy ${VERSION} listening at http://${HOST}:${PORT}/v1`);
   console.log(`models: ${Object.keys(MODELS).join(', ')}`);
+  const pauses = accounts.listPauses();
+  if (pauses.length) {
+    console.log(
+      `quota pause active: ${pauses
+        .map((p) => `${p.modelId} until ${p.nextResetAt}`)
+        .join(', ')}`
+    );
+    schedulePauseWake();
+  }
   // import the account currently signed in to agy (if not in the vault yet)
   // and refresh project/quota for all accounts in the background
   accounts.bootstrap().then(

@@ -186,12 +186,15 @@ The provider uses the active account first and switches automatically when a quo
 
 - Accounts whose reset time has passed are tried first. Otherwise the active account is tried first and stays active after a success (sticky).
 - A quota `429` (`QUOTA_EXHAUSTED`, `quotaResetTimeStamp`, or "individual quota") marks the account exhausted for that model until the reset time and moves to the next account.
+- Any `429` moves on to the next account. Before switching, the account's live quota is read: no quota left marks it exhausted until the reset time, while quota still available parks it for a short cooldown (the backend refused that account, not its quota).
+- The bare `429` "Resource has been exhausted (e.g. check quota)" carries no details and is what Cloud Code returns for both cases, so it is never trusted on its own.
 - Failover is per model: exhausted Claude quota does not block Gemini, and vice versa.
 - A successful response clears the exhausted marker and makes that account active.
-- A generic `429` without quota details (for example, a large Gemini input) does not switch accounts.
 - A `401` refreshes the token and retries once. If it still fails, the account is marked invalid and the next one is tried.
 - `5xx` gets one retry per account before moving on.
-- If every account is out of quota, the response is `429` with the next reset time. If no account is usable, it is `503`.
+- If every account is out of quota for a model, the provider **pauses** that model: no upstream attempt is made, requests get `429` with a `retry-after` header pointing at the next reset, and a `paused` event is emitted. When the first account resets, the pause is lifted, that account becomes active, and a `resumed` event notifies the client. The pause is persisted, so a restart keeps the gate closed until the reset.
+- If every account answers `429` while their quota still shows availability, the provider reports the usage of all accounts on that model (`usage` event) and returns `429` with a short `retry-after` instead of pausing.
+- If no account is usable at all, the response is `503`.
 
 Check status at any time:
 
@@ -259,6 +262,43 @@ When the previous account is recovered:
 🤖 Model     claude-sonnet-4-6
 🎯 Quota     🟢 100% remaining  ██████████
 ⏳ Reset     11/16 05:20 (in 4h 41min)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+When every account runs out of quota for a model, the provider pauses and notifies once; it notifies again when the first account resets:
+
+```text
+⏸️ PROVIDER PAUSED · ALL ACCOUNTS OUT OF QUOTA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 Model     gemini-3.8-flash-high
+🛑 Reason    every account in the vault is exhausted
+⏳ Resume    11/16 12:00 (in 42min)
+🚫 Requests  rejected until the first account resets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+```text
+▶️ PROVIDER RESUMED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👤 Account   account-a@example.com
+🤖 Model     gemini-3.8-flash-high
+🎯 Quota     🟢 100% remaining  ██████████
+⏳ Reset     11/17 12:00 (in 1d)
+✅ Requests  accepted again
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+When every account refuses a request (429) even though quota is available, the provider refreshes all of them, shows the usage of the selected model, and returns a short `retry-after` so the next request starts on another account:
+
+```text
+📉 MODEL QUOTA · ALL ACCOUNTS FAILED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 Model     gemini-3.8-flash-high
+📌 Reason    every account answered 429 while quota still shows availability
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📉 USAGE ON THIS MODEL
+🟡  42%  account-a@example.com · reset 11/16 16:00
+🟢 100%  account-b@example.com · reset 11/17 04:00
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 

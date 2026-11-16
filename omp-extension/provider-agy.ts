@@ -158,6 +158,23 @@ function quotaLine(account) {
   return `${quotaCircle(value)} ${pct(value)}  ${quotaBar(value)}`;
 }
 
+function modelUsageLines(event) {
+  const list = Array.isArray(event.accounts) ? event.accounts : [];
+  if (!list.length) return [];
+  const lines = ["📉 USAGE ON THIS MODEL"];
+  for (const account of list) {
+    const value = account.remainingFraction;
+    const percent = value == null ? "    ?" : `${String(Math.round(value * 100)).padStart(4)}%`;
+    const details = [];
+    if (account.resetTime) details.push(`reset ${when(account.resetTime)}`);
+    if (account.cooldownUntil) details.push(`parked until ${when(account.cooldownUntil)}`);
+    if (account.invalid) details.push("invalid");
+    const suffix = details.length ? ` · ${details.join(" · ")}` : "";
+    lines.push(`${quotaCircle(value)} ${percent}  ${accountName(account)}${suffix}`);
+  }
+  return lines;
+}
+
 function usageLines(event) {
   const window = event.window;
   if (!window || !window.hasUsage) {
@@ -241,6 +258,54 @@ export function formatEvent(event) {
     );
   }
 
+  if (event.type === "paused") {
+    const pause = event.pause || {};
+    const lines = [
+      "⏸️ PROVIDER PAUSED · ALL ACCOUNTS OUT OF QUOTA",
+      RULE,
+      `🤖 Model     ${event.model}`,
+      `🛑 Reason    every account in the vault is exhausted`,
+      `⏳ Resume    ${resetInfo(pause.nextResetAt)}`,
+      "🚫 Requests  rejected until the first account resets",
+    ];
+    const usage = modelUsageLines(event);
+    if (usage.length) lines.push(RULE, ...usage);
+    lines.push(RULE);
+    return lines.join("\n");
+  }
+
+  if (event.type === "usage") {
+    const reasons = {
+      "rate-limited": "every account answered 429 while quota still shows availability",
+      "all-failed": "no account could answer this request",
+    };
+    const lines = [
+      "📉 MODEL QUOTA · ALL ACCOUNTS FAILED",
+      RULE,
+      `🤖 Model     ${event.model}`,
+      `📌 Reason    ${reasons[event.reason] || event.reason || "all accounts failed"}`,
+    ];
+    if (event.message) lines.push(`📝 Detail    ${truncate(event.message, 200)}`);
+    const usage = modelUsageLines(event);
+    if (usage.length) lines.push(RULE, ...usage);
+    lines.push(RULE);
+    return lines.join("\n");
+  }
+
+  if (event.type === "resumed") {
+    const account = event.account || {};
+    return [
+      "▶️ PROVIDER RESUMED",
+      RULE,
+      `👤 Account   ${accountName(account)}`,
+      `🤖 Model     ${event.model}`,
+      `🎯 Quota     ${quotaLine(account)}`,
+      `⏳ Reset     ${resetInfo(account.resetTime)}`,
+      "✅ Requests  accepted again",
+      RULE,
+    ].join("\n");
+  }
+
   if (event.type === "recovered") {
     const to = event.to || {};
     return [
@@ -281,6 +346,9 @@ export function formatEvent(event) {
 
 function levelFor(event) {
   if (event.type === "blocked") return "error";
+  if (event.type === "paused") return "warning";
+  if (event.type === "usage") return "warning";
+  if (event.type === "resumed") return "info";
   if (event.type === "status") {
     const remaining = event.account?.remainingFraction;
     return remaining != null && remaining <= 0.2 ? "warning" : "info";
