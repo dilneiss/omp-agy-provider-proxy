@@ -815,6 +815,17 @@ function retryAfterSeconds(resetAt) {
   return Math.max(1, Math.ceil(ms / 1000));
 }
 
+// An ambiguous 429 that carries no quota evidence only proves that one account
+// refused a request. Without a confirmed reset it must never be turned into a
+// fabricated quota window: the account is parked for a short cooldown (the
+// upstream Retry-After when present) so the next attempt starts elsewhere.
+const RATE_LIMIT_COOLDOWN_MS = 15 * 1000;
+const RATE_LIMIT_COOLDOWN_MAX_MS = 5 * 60 * 1000;
+
+function rateLimitCooldownMs(upstreamDelay) {
+  return Math.min(upstreamDelay || RATE_LIMIT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_MAX_MS);
+}
+
 /** Wait the backend asked for, taken from the header or the RetryInfo delay. */
 function retryAfterMs(headers, text) {
   const header = Number(headers?.['retry-after']);
@@ -833,16 +844,16 @@ function retryAfterMs(headers, text) {
   return 0;
 }
 
-/**
- * Refreshes every account and reports the usage of the selected model, so the
- * "all accounts failed" notices show real numbers from the whole vault.
- */
 const reportThrottle = new Map();
 
-async function accountUsageReport(modelId) {
-  for (const account of accounts.listAccounts()) {
-    try { await accounts.refreshAccountMeta(account); } catch {}
-  }
+/**
+ * Builds the "all accounts failed" usage report of the selected model from the
+ * cached vault state. It deliberately does not refresh accounts: this runs on
+ * the request failure path, and serial upstream project/quota calls per
+ * account would delay the client's 429. Live quota checks stay in the attempt
+ * and reset-wake paths.
+ */
+function accountUsageReport(modelId) {
   return accounts.publicList().map((account) => {
     const q = account.quota?.[modelId] || {};
     return {
@@ -863,7 +874,7 @@ async function reportAllAccounts({ modelId, reason, message, force = false }) {
   const last = reportThrottle.get(modelId) || 0;
   if (!force && Date.now() - last < 60_000) return null;
   reportThrottle.set(modelId, Date.now());
-  const list = await accountUsageReport(modelId);
+  const list = accountUsageReport(modelId);
   pushAccountEvent({
     type: 'usage',
     model: modelId,
@@ -922,11 +933,17 @@ async function checkPauses() {
 
       const account = accounts.selectAccountsFor(pause.modelId)[0];
       if (!account) {
-        // Nothing released yet: wait for the next known reset, or retry soon.
+        // Nothing released yet: wake at the next real reset or cooldown. Only
+        // when neither is known does the pause short-poll, so an undetermined
+        // reset never becomes an invented five-minute quota window.
         const upcoming = Date.parse(accounts.nextResetFor(pause.modelId) || '') || 0;
+        const cooling = Date.parse(accounts.nextCooldownFor(pause.modelId) || '') || 0;
+        const wakeAt = Math.max(upcoming, cooling);
         accounts.setPause(pause.modelId, {
           ...pause,
-          nextResetAt: new Date(Math.max(upcoming, now + 5 * 60 * 1000)).toISOString(),
+          nextResetAt: new Date(
+            wakeAt > now ? wakeAt : now + RATE_LIMIT_COOLDOWN_MS
+          ).toISOString(),
         });
         continue;
       }
@@ -958,7 +975,7 @@ async function pauseForQuota(modelId, nextResetAt, message) {
   const pause = accounts.setPause(modelId, { nextResetAt, reason: 'quota', message });
   if (!before) {
     // Show where every account stands on the selected model before pausing.
-    const list = await accountUsageReport(modelId);
+    const list = accountUsageReport(modelId);
     pushAccountEvent({
       type: 'paused',
       model: modelId,
@@ -979,6 +996,10 @@ async function pauseForQuota(modelId, nextResetAt, message) {
   schedulePauseWake();
   return pause;
 }
+
+// The upstream transport is indirected so the rotation logic can be exercised
+// without the network.
+const rotationDeps = { callAccount };
 
 /**
  * Tries vault accounts in preference order. On a quota 429, marks the account
@@ -1018,7 +1039,7 @@ async function postWithAccounts(body, modelId) {
       if (accounts.isBlocked()) {
         return { statusCode: 403, text: blockedMessage() };
       }
-      const out = await callAccount(body, account);
+      const out = await rotationDeps.callAccount(body, account);
 
       if (out.ok) {
         const info = accounts.markSuccess(account.id, modelId);
@@ -1087,18 +1108,25 @@ async function postWithAccounts(body, modelId) {
         let resetAt = quota.resetAt;
         const upstreamDelay = retryAfterMs(out.headers, out.text);
 
-        // Cloud Code usually answers with a bare 429 "Resource has been
-        // exhausted (e.g. check quota)" and no details, which is identical for
-        // account quota and for a per-account rate limit. Ask the account's
-        // quota endpoint to tell them apart.
+        // A bare 429 is ambiguous. Do not make an extra network request to
+        // fetch quota before trying the next account: that serial lookup is
+        // slower than the fallback itself. Only trust a cached, unexpired
+        // zero-quota reading; otherwise park briefly and rotate immediately.
         if (!isQuota && quota.ambiguous) {
-          const state = await accounts.quotaStateFor(account, modelId);
-          const known = state && state.remainingFraction != null;
-          if (known && state.remainingFraction > 0) {
-            // Quota is not spent, so the account itself is refusing requests.
-            // Park it briefly instead of retrying it on every request: the
-            // next attempt must start on another account.
-            const cooldownMs = Math.min(upstreamDelay || 2 * 60 * 1000, 5 * 60 * 1000);
+          const cached = account.quota?.[modelId];
+          const reset = cached?.exhaustedUntil || cached?.resetTime;
+          const resetMs = Date.parse(reset || '');
+          const cachedSpent =
+            cached?.remainingFraction != null &&
+            cached.remainingFraction <= 0 &&
+            Number.isFinite(resetMs) &&
+            resetMs > Date.now();
+
+          if (cachedSpent) {
+            isQuota = true;
+            resetAt = reset;
+          } else {
+            const cooldownMs = rateLimitCooldownMs(upstreamDelay);
             accounts.markCooldown(
               account.id,
               modelId,
@@ -1106,18 +1134,9 @@ async function postWithAccounts(body, modelId) {
               quota.message
             );
             console.warn(
-              `[agy] 429 on ${account.email} for ${modelId} with quota at ${Math.round(
-                state.remainingFraction * 100
-              )}%; parked for ${Math.round(cooldownMs / 1000)}s and trying next account`
-            );
-          } else {
-            isQuota = true;
-            resetAt =
-              resetAt ||
-              state?.resetTime ||
-              new Date(Date.now() + (upstreamDelay || 5 * 60 * 1000)).toISOString();
-            console.warn(
-              `[agy] 429 on ${account.email} for ${modelId} confirmed as quota exhaustion (reset ${resetAt})`
+              `[agy] 429 on ${account.email} for ${modelId} with quota state not freshly confirmed; parked for ${Math.round(
+                cooldownMs / 1000
+              )}s and trying next account`
             );
           }
         }
@@ -1173,11 +1192,16 @@ async function postWithAccounts(body, modelId) {
       message: last.text,
     });
   }
+  // When every account was simply parked after a 429, point the client at the
+  // earliest cooldown that actually exists rather than a fixed 30 seconds.
+  const cooldown = next ? null : accounts.nextCooldownFor(modelId);
   const retryAfter = next
     ? String(retryAfterSeconds(next))
-    : last?.statusCode === 429
-      ? '30'
-      : null;
+    : cooldown
+      ? String(retryAfterSeconds(cooldown))
+      : last?.statusCode === 429
+        ? String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000))
+        : null;
   const headers = retryAfter ? { 'retry-after': retryAfter } : undefined;
   if (last) {
     const suffix = next
@@ -1185,7 +1209,7 @@ async function postWithAccounts(body, modelId) {
         ? `\n\nAll vault accounts are out of quota for ${modelId}. The provider is paused until ${next}.`
         : `\n\nNo vault account could respond for ${modelId}. Next quota available: ${next}.`
       : last.statusCode === 429
-        ? `\n\nEvery vault account answered 429 for ${modelId} but their quota still shows availability, so this is a per-account limit rather than exhausted quota. The next request tries another account first.`
+        ? `\n\nEvery vault account answered 429 for ${modelId}, so this is a per-account limit rather than confirmed exhausted quota. The next request tries another account first.`
         : '';
     return { statusCode: last.statusCode, headers, text: last.text + suffix };
   }
@@ -1646,7 +1670,7 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, openAiError('not found', 404, 'invalid_request_error'));
 });
 
-server.listen(PORT, HOST, () => {
+if (require.main === module) server.listen(PORT, HOST, () => {
   console.log(`provider-agy ${VERSION} listening at http://${HOST}:${PORT}/v1`);
   console.log(`models: ${Object.keys(MODELS).join(', ')}`);
   const pauses = accounts.listPauses();
@@ -1690,3 +1714,5 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
   server.close(() => process.exit(0));
 });
+
+module.exports = { postWithAccounts, rotationDeps };

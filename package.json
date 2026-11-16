@@ -6,6 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test": "node --test",
     "accounts": "node tools/accounts.js",
     "install:omp": "node tools/install-omp.js",
     "quota": "node tools/quota.js"
