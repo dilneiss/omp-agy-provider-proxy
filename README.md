@@ -28,6 +28,46 @@ Sessões criadas antes da persistência, ou cujo tool call antigo não tem assin
 - Node.js 18+ (testado com Node 24).
 - `omp` 18.x (opcional; qualquer cliente OpenAI-compatible serve).
 
+## Configuração rápida com um agente do omp
+
+Copie o prompt abaixo e cole em uma sessão do omp (de preferência com a pasta deste projeto como diretório de trabalho). Ele foi escrito para um agente com acesso ao shell configurar o provider, a extensão, as contas e validar tudo:
+
+```text
+Configure o provider-agy nesta máquina e deixe o omp pronto para usá-lo.
+
+Contexto: este é o repositório do provider-agy (se não estiver nele, clone
+https://github.com/dilneiss/omp-agy-provider-proxy.git). O provider é
+OpenAI-compatible em http://127.0.0.1:8788/v1 e sobe automaticamente pelo omp
+graças a uma extensão.
+
+Faça, nesta ordem:
+
+1. Confirme que o agy está instalado e logado com `agy -p "ok"`. Se falhar,
+   pare e me peça para autenticar com `agy acp --login`.
+2. Verifique se existe ~/.provider-agy/oauth.json ou se AGY_OAUTH_CLIENT_ID e
+   AGY_OAUTH_CLIENT_SECRET estão definidos. Se não existirem, me peça os
+   valores do client OAuth embutido no agy; não invente valores, não imprima
+   segredos e crie o arquivo com permissão restrita.
+3. Rode `npm run install:omp` para instalar a extensão de auto-start.
+4. Garanta em ~/.omp/agent/models.yml um provider `agy` com:
+   baseUrl: http://127.0.0.1:8788/v1
+   api: openai-completions
+   auth: none
+   e os modelos gemini-3.8-flash-high/medium/low (contextWindow 1048576,
+   maxTokens 65536), claude-sonnet-4-6 e claude-opus-4-6-thinking
+   (contextWindow 250000, maxTokens 64000), gpt-oss-120b-medium
+   (contextWindow 131072, maxTokens 32768). Faça backup antes de editar.
+5. Rode `npm run accounts -- add` e depois `npm run accounts -- list`.
+6. Suba o provider com `npm start` em background, espere /health responder e
+   teste um POST em /v1/chat/completions com o modelo gemini-3.8-flash-high.
+7. Rode `omp models agy` e confirme que os 6 modelos aparecem.
+8. Não faça commit de accounts.json, oauth.json, state.json, tokens ou logs.
+   Não exponha e-mails, tokens ou quotas reais na sua resposta.
+
+No final, resuma: contas importadas, quota por modelo, se o auto-start está
+instalado e o resultado do teste de geração.
+```
+
 ## Instalação
 
 ```bash
@@ -352,7 +392,7 @@ Fluxos validados neste projeto:
 - fallback automático quando a conta ativa está inválida;
 - evento de troca de conta com conta anterior, motivo, reset e quota da conta nova;
 - retorno prioritário à conta anterior depois do horário de reset;
-- início automático do provider pela extensão do omp;
+- início automático do provider pela extensão do omp, inclusive com o servidor parado (`omp -p` respondeu sem `npm start`);
 - resposta 429 com horário de reset quando todas as contas estão sem quota para o modelo.
 
 ## Diagnóstico
@@ -397,3 +437,73 @@ omp-agy.cmd                   sobe o provider se necessário e abre o omp
 - O client OAuth usado é o mesmo embutido no binário distribuído do `agy`, mas **não é distribuído neste repositório**: você o configura em `~/.provider-agy/oauth.json` ou pelas variáveis `AGY_OAUTH_CLIENT_ID`/`AGY_OAUTH_CLIENT_SECRET`.
 - Usar a credencial do Antigravity fora do cliente oficial pode contrariar os termos do serviço. O fingerprint replica o `agy`, mas isso não garante ausência de bloqueios.
 - O limite de ~40k tokens e o formato do Cloud Code são do backend e podem mudar sem aviso.
+
+## Autenticando contas do Gemini
+
+Quem autentica é o próprio `agy`; o provider apenas importa o token que já está no keyring. O fluxo completo é:
+
+### Primeira conta
+
+```bash
+# 1. abra o agy e faça login pelo Google
+agy
+# dentro da TUI, rode:
+#   /login
+# escolha a conta Google com acesso ao Antigravity/Gemini Code Assist
+
+# alternativa sem TUI (login interativo e sai):
+agy acp --login
+
+# 2. confirme que a conta responde
+agy -p "ok"
+
+# 3. importe para o cofre do provider
+npm run accounts -- add
+npm run accounts -- list
+npm run quota
+```
+
+O `add` guarda no cofre o access token, o refresh token e o e-mail da conta. A partir daí o provider renova o token sozinho e o `agy` pode continuar sendo usado normalmente.
+
+### Adicionar outra conta sem perder a primeira
+
+O keyring do Windows guarda **uma conta por vez**. O cofre é o que preserva as anteriores:
+
+```bash
+# 1. garanta que a conta atual está salva
+npm run accounts -- add
+
+# 2. troque de conta no agy
+agy
+# na TUI: /login e escolha a outra conta Google
+# (se o agy não oferecer troca direta, saia e entre de novo com a outra conta)
+
+# 3. confirme e importe a nova
+agy -p "ok"
+npm run accounts -- add
+
+# 4. veja as duas e suas quotas
+npm run accounts -- list
+npm run quota
+```
+
+O provider passa a alternar sozinho entre elas quando a quota de uma acaba. Para o `agy` voltar a usar uma conta específica do cofre:
+
+```bash
+npm run accounts -- use conta@exemplo.com
+# ou pelo índice mostrado no list:
+npm run accounts -- use 2
+agy -p "ok"
+```
+
+### Conta sem acesso ou token expirado
+
+Se o login do Google não tiver acesso ao Antigravity/Gemini Code Assist, o `agy` falha antes de o provider entrar. Se o refresh token for revogado, o provider marca a conta como inválida e usa outra; para recuperar:
+
+```bash
+agy acp --login          # faça login de novo
+npm run accounts -- add  # atualiza o token da mesma conta no cofre
+npm run accounts -- list # confirme que ela não está mais marcada como inválida
+```
+
+A quota é **por modelo e por conta**. `npm run quota` mostra `remainingFraction` e `resetTime` de cada modelo; quando uma conta esgota, o provider troca e exibe o banner no omp, voltando para a conta anterior assim que o reset passa.
