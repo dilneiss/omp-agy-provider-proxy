@@ -21,7 +21,7 @@ const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-rotation-'));
 process.env.AGY_STATE_DIR = stateDir;
 
 const accounts = require('../lib/accounts');
-const { postWithAccounts, rotationDeps } = require('../server');
+const { postWithAccounts, rotationDeps, buildCloudRequest } = require('../server');
 
 const MODEL = 'gemini-3.8-flash-high';
 const AMBIGUOUS_429 = JSON.stringify({
@@ -93,13 +93,32 @@ test('ambiguous 429 rotates immediately without a serial quota lookup', async ()
   assert.equal(result.account.id, 'b');
   assert.deepEqual(calls, ['a', 'b'], 'the second account must serve the request');
 
-  const q = accounts.findAccount('a').quota[MODEL];
+  const q = accounts.findAccount('a').quota?.[MODEL] || {};
   assert.equal(q.exhaustedUntil, undefined, 'unknown state must not park it as exhausted');
   assert.equal(q.remainingFraction ?? null, null, 'exhaustion must not overwrite the quota reading');
-  const cooldownMs = Date.parse(q.cooldownUntil) - startedAt;
-  assert.ok(cooldownMs > 0 && cooldownMs <= 15_000 + 500, `cooldown should be brief, got ${cooldownMs}ms`);
+  assert.equal(q.cooldownUntil, undefined, 'an account that was not retried to the end must not be parked');
   assert.equal(accounts.nextResetFor(MODEL), null, 'no quota reset should be invented');
   assert.equal(accounts.getPause(MODEL), null, 'the model must not be paused');
+});
+test('429 diagnostics report request size without logging prompt contents', async () => {
+  const calls = [];
+  const originalWarn = console.warn;
+  const logs = [];
+  stubCallAccount(calls);
+  console.warn = (...args) => logs.push(args.join(' '));
+  try {
+    await postWithAccounts(
+      { prompt: 'PRIVATE_PROMPT_SENTINEL', project: 'aicode-consumers' },
+      MODEL
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const diagnostic = logs.find((line) => line.includes('429 diagnostics:'));
+  assert.ok(diagnostic, 'a 429 diagnostic line should be emitted');
+  assert.match(diagnostic, /inputEstimate=\d+ limit=30000 bodyBytes=\d+/);
+  assert.ok(!logs.join('\n').includes('PRIVATE_PROMPT_SENTINEL'));
 });
 
 test('a cached zero quota excludes the account until its real reset without a lookup', async () => {
@@ -182,7 +201,7 @@ test('the usage report is built from cached quota without refreshing accounts', 
 
   assert.equal(result.statusCode, 429);
   assert.equal(refreshes, 0, 'the failure report must not refresh accounts serially');
-  assert.ok(elapsedMs < 1000, `the 429 must not wait for quota refreshes, took ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 4000, `the 429 must not wait for quota refreshes, took ${elapsedMs}ms`);
   // The cached reading is still what the report saw.
   assert.equal(accounts.findAccount('a').quota[reportModel].remainingFraction, 0.42);
 });
@@ -203,4 +222,15 @@ test('an oversized Retry-After is bounded to five minutes', async () => {
   const cooldownMs = Date.parse(q.cooldownUntil) - startedAt;
   assert.ok(cooldownMs > 4 * 60 * 1000 && cooldownMs <= 5 * 60 * 1000 + 500, `got ${cooldownMs}ms`);
   assert.equal(q.exhaustedUntil, undefined);
+});
+test('large OMP system prompts are trimmed below the backend context limit', () => {
+  const prompt = 'x'.repeat(140_000);
+  const { body } = buildCloudRequest({
+    model: MODEL,
+    messages: [{ role: 'system', content: prompt }, { role: 'user', content: 'test' }],
+  });
+
+  const systemText = body.request.systemInstruction.parts[0].text;
+  assert.ok(systemText.length < prompt.length, 'oversized OMP system content must be trimmed');
+  assert.ok(systemText.includes('skills/MCP catalog truncated by provider-agy'));
 });

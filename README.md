@@ -186,7 +186,9 @@ The provider uses the active account first and switches automatically when a quo
 
 - Accounts whose reset time has passed are tried first. Otherwise the active account is tried first and stays active after a success (sticky).
 - A quota `429` (`QUOTA_EXHAUSTED`, `quotaResetTimeStamp`, or "individual quota") marks the account exhausted for that model until the reset time and moves to the next account.
-- Any `429` moves on to the next account. Before switching, the account's live quota is read: no quota left marks it exhausted until the reset time, while quota still available parks it for a short cooldown (the backend refused that account, not its quota).
+- Any `429` moves on to the next account immediately, without an extra quota request first: that lookup would serialize behind the failure and slow the fallback. A cached, still-valid zero reading is the only thing that promotes it to real exhaustion.
+- A `429` without quota evidence parks the account for a short cooldown (the upstream `Retry-After`, capped at five minutes, 15s otherwise). The cooldown is written only when the request finally gives up, so an account that refused once is not burned while another account still answers.
+- Every vault account signs in to the same Cloud Code project, so a bare `429` is a request/project rejection, not a per-account quota. Before giving up, the provider retries the whole set once after a short pause (`AGY_ROTATION_ROUNDS`, default 2; in-request wait capped by `AGY_ROTATION_ROUND_MAX_WAIT_MS`, default 1500ms).
 - The bare `429` "Resource has been exhausted (e.g. check quota)" carries no details and is what Cloud Code returns for both cases, so it is never trusted on its own.
 - Failover is per model: exhausted Claude quota does not block Gemini, and vice versa.
 - A successful response clears the exhausted marker and makes that account active.
@@ -507,6 +509,7 @@ curl -N -X POST http://127.0.0.1:8788/v1/chat/completions \
 | `invalid_grant` on one account | Refresh token revoked or expired | Sign in again with `agy` and run `npm run accounts -- add` |
 | `429 QUOTA_EXHAUSTED` | Model quota is exhausted | Wait for `resetTime` or add another account |
 | Generic `429` on a large prompt | Per-request input limit (~40k tokens) | Lower `AGY_MAX_INPUT_TOKENS`, remove skills/MCP, or reduce context |
+| Need to know what the backend actually rejected | The extension starts the provider with stdio ignored, so terminal output is lost | Read `~/.provider-agy/provider.log` (warnings/errors, 2MB rotation, override with `AGY_LOG_FILE`) |
 | Red global block notice | Google rejected an account for a ban/suspension | Resolve it with Google and run `npm run accounts -- unblock` |
 | `403 SECURITY BLOCK` on every request | Global block is stored in the vault | Run `npm run accounts -- list`, then `unblock` after resolving it |
 | `no account available` | Empty vault or all accounts invalid | Run `npm run accounts -- list` and `npm run accounts -- add` |

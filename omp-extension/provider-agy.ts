@@ -327,6 +327,7 @@ export function formatEvent(event) {
     quota: "quota exhausted",
     invalid: "invalid account or rejected token",
     error: "temporary account error",
+    "rate-limited": "429 without quota evidence (shared project throttle)",
   };
   const reason = reasons[event.reason] || event.reason || "unavailable";
   const lines = [
