@@ -588,14 +588,15 @@ export default function providerAgy(pi) {
     compacting = true;
     lastCompactAt = Date.now();
     const percent = Math.round((tokens / budget.maxInputTokens) * 100);
+    logLine(`compacting at ${percent}% of ${budget.maxInputTokens} tokens`);
     try {
+      await ctx.compact();
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `Provider context at ${percent}% of ${budget.maxInputTokens} tokens (threshold ${budget.compactAtPercent}%); compacting automatically`,
-          "warning"
+          `Context compacted at ${percent}% of the provider budget (${budget.maxInputTokens} tokens)`,
+          "info"
         );
       }
-      await ctx.compact();
     } catch (err) {
       const message = String(err?.message ?? err ?? "");
       // "Nothing to compact" means omp has no summarizable history in this

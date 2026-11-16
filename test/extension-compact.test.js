@@ -49,8 +49,8 @@ test('crossing 80% of the provider budget compacts the session', async () => {
 
   assert.equal(session.compactionCount(), 1, 'compaction must run once');
   assert.equal(session.notifications.length, 1);
-  assert.match(session.notifications[0].text, /80%\s+of\s+30000/);
-  assert.equal(session.notifications[0].level, 'warning');
+  assert.match(session.notifications[0].text, /compacted at 80% of the provider budget/);
+  assert.equal(session.notifications[0].level, 'info');
 });
 
 test('a session below the threshold is left alone', async () => {
