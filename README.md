@@ -89,7 +89,22 @@ Ou use o launcher que sobe o provider se necessário e abre o omp:
 omp-agy.cmd
 ```
 
-Para listar/validar os modelos:
+### Iniciar o provider automaticamente pelo omp
+
+O `models.yml` do omp não inicia servidores, mas o omp carrega extensões. Este projeto inclui uma extensão que sobe o provider na primeira sessão e mostra os avisos de troca de conta:
+
+```bash
+npm run install:omp
+```
+
+O instalador:
+
+- copia `omp-extension/provider-agy.ts` para `~/.omp/agent/extensions/`;
+- grava o caminho deste projeto em `~/.provider-agy/config.json`.
+
+Reinicie o omp. Na próxima sessão, se o provider ainda não estiver rodando, a extensão executa `node server.js` em segundo plano e avisa no omp. Se já estiver rodando, ela apenas se conecta. O servidor fica ativo depois que o omp fecha, para a próxima sessão e para outros clientes.
+
+Para descobrir os modelos:
 
 ```bash
 omp models agy
@@ -193,7 +208,8 @@ Contas no cofre (2):
 
 ### Como o roteamento funciona
 
-- O provider tenta primeiro a **conta ativa**. Se ela responder, continua ativa (sticky).
+- O provider tenta primeiro uma conta cujo **reset já passou**; se não houver, tenta a **conta ativa**. Se ela responder, continua ativa (sticky).
+- Quando o horário de reset de uma conta esgotada passa, ela volta para a frente da fila na próxima requisição. Se ainda estiver sem quota, recebe outro 429 e o provider segue para a próxima.
 - Em **429 de quota** (`QUOTA_EXHAUSTED`, `quotaResetTimeStamp` ou mensagem de “individual quota”), a conta é marcada como esgotada **para aquele modelo** até o horário de reset e o provider tenta a próxima conta automaticamente.
 - O fallback é **por modelo**: Claude esgotado não impede o Gemini, e vice-versa.
 - Se a conta responder com sucesso, ela vira a ativa e a marcação de esgotada é removida.
@@ -209,12 +225,41 @@ curl http://127.0.0.1:8788/health
 curl http://127.0.0.1:8788/v1/accounts
 ```
 
+### Avisos de troca de conta no omp
+
+A extensão consulta `GET /v1/accounts/events` a cada 2 segundos e mostra uma notificação na TUI quando a conta muda. Exemplo:
+
+```text
+provider-agy trocou de conta (claude-sonnet-4-6)
+Motivo: quota esgotada
+De: conta-a@exemplo.com | 0% restante | reset: 16/11/2026 03:52
+Para: conta-b@exemplo.com | 85% restante | reset: 16/11/2026 04:20
+```
+
+Quando a conta anterior é liberada e o provider volta para ela:
+
+```text
+provider-agy: conta liberada, voltando para conta-a@exemplo.com
+Modelo: claude-sonnet-4-6
+Quota atual: 100% restante | reset: 16/11/2026 05:20
+```
+
+O motivo pode ser `quota`, `invalid` (token/conta recusados) ou `error` (falha temporária). As quotas do aviso são atualizadas no momento da troca; se a consulta falhar, aparece a última leitura conhecida ou “sem leitura”. Os avisos aparecem apenas em sessões interativas do omp; em `-p`/RPC eles não são exibidos.
+
+O mesmo histórico fica disponível para qualquer cliente:
+
+```bash
+curl 'http://127.0.0.1:8788/v1/accounts/events?since=0'
+# since=-1 retorna só o cursor atual, sem eventos antigos
+curl 'http://127.0.0.1:8788/v1/accounts/events?since=-1'
+```
+
 ### Cofre e segurança dos tokens
 
 - Arquivo: `~/.provider-agy/accounts.json` (ou `AGY_STATE_DIR/accounts.json`).
 - Guarda token de acesso, refresh token, e-mail de identificação, projeto e quota de cada conta.
 - No Windows, o arquivo recebe ACL restrita ao seu usuário (`icacls`).
-- O cofre fica **fora do repositório** e `accounts.json`/`state.json` estão no `.gitignore`. Nunca faça commit dele.
+- O cofre fica **fora do repositório** e `accounts.json`/`state.json`/`oauth.json` estão no `.gitignore`. Nunca faça commit dele.
 - `npm run accounts -- use` é a única operação que altera o keyring do `agy`; o uso normal do provider não mexe nele.
 
 ## Limites: contexto, requisição e quota
@@ -262,6 +307,9 @@ omp --model agy/claude-sonnet-4-6 --no-skills --no-rules --no-context-files --no
 |---|---|---|
 | `AGY_PROVIDER_HOST` | `127.0.0.1` | endereço local do servidor |
 | `AGY_PROVIDER_PORT` | `8788` | porta local |
+| `AGY_PROVIDER_URL` | `http://127.0.0.1:8788` | URL usada pela extensão do omp |
+| `AGY_PROVIDER_DIR` | lido de `~/.provider-agy/config.json` | pasta do provider que a extensão deve iniciar |
+| `AGY_NODE` | `node` | executável usado pela extensão para subir o servidor |
 | `AGY_MAX_INPUT_TOKENS` | `38000` | orçamento de tokens de entrada por requisição |
 | `AGY_TRIM` | `1` | `0` desabilita o ajuste de contexto (pode tomar 429) |
 | `AGY_PROJECT` | `aicode-consumers` | projeto enviado ao Cloud Code |
@@ -282,6 +330,7 @@ agy -p "ok"
 # servidor e contas
 curl http://127.0.0.1:8788/health
 curl http://127.0.0.1:8788/v1/accounts
+curl http://127.0.0.1:8788/v1/accounts/events?since=-1
 curl http://127.0.0.1:8788/v1/models
 
 # request não-streaming
@@ -301,6 +350,9 @@ Fluxos validados neste projeto:
 - streaming SSE, `functionCall`, `functionResponse`, `thoughtSignature` e usage;
 - importação de conta do keyring para o cofre;
 - fallback automático quando a conta ativa está inválida;
+- evento de troca de conta com conta anterior, motivo, reset e quota da conta nova;
+- retorno prioritário à conta anterior depois do horário de reset;
+- início automático do provider pela extensão do omp;
 - resposta 429 com horário de reset quando todas as contas estão sem quota para o modelo.
 
 ## Diagnóstico
@@ -314,6 +366,9 @@ Fluxos validados neste projeto:
 | `429` sem detalhes, em prompt grande | limite de entrada por requisição (~40k tokens) | reduza `AGY_MAX_INPUT_TOKENS`, remova skills/MCP ou diminua o contexto |
 | `nenhuma conta disponível` | cofre vazio ou todas inválidas | `npm run accounts -- list` e `npm run accounts -- add` |
 | porta 8788 ocupada | outro provider/processo rodando | pare o processo ou use `AGY_PROVIDER_PORT=8790` |
+| provider não sobe sozinho no omp | extensão não instalada ou caminho antigo | rode `npm run install:omp` e reinicie o omp |
+| aviso de troca não aparece | sessão `-p`/RPC ou extensão não carregada | use a TUI e confira `/extensions` no omp |
+| extensão instalada mas servidor não encontra | projeto movido/renomeado | rode `npm run install:omp` de novo |
 
 Para parar um processo antigo na porta (Windows):
 
@@ -325,13 +380,15 @@ taskkill /PID <pid> /F
 ## Estrutura do projeto
 
 ```text
-server.js              servidor HTTP, tradução OpenAI <-> Cloud Code, streaming e tools
-lib/accounts.js        cofre multi-contas, refresh OAuth, quota, seleção e fallback
-tools/accounts.js      CLI de contas (list/add/use/remove/quota/login)
-tools/quota.js         diagnóstico de quota usando o cofre
-tools/keyring.ps1      leitura/escrita do Credential Manager do Windows
-start.cmd              inicia o provider no Windows
-omp-agy.cmd            sobe o provider se necessário e abre o omp
+server.js                     servidor HTTP, tradução OpenAI <-> Cloud Code, streaming e tools
+lib/accounts.js               cofre multi-contas, refresh OAuth, quota, seleção e fallback
+tools/accounts.js             CLI de contas (list/add/use/remove/quota/login)
+tools/quota.js                diagnóstico de quota usando o cofre
+tools/install-omp.js          instala a extensão que sobe o provider automaticamente
+tools/keyring.ps1             leitura/escrita do Credential Manager do Windows
+omp-extension/provider-agy.ts extensão do omp: auto-start e avisos de troca de conta
+start.cmd                     inicia o provider no Windows
+omp-agy.cmd                   sobe o provider se necessário e abre o omp
 ```
 
 ## Aviso

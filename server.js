@@ -591,6 +591,84 @@ async function callAccount(body, account) {
   return { statusCode: res.statusCode, headers: res.headers, text };
 }
 
+// ---------------------------------------------------------------------------
+// Eventos de troca de conta (consumidos pela extensão do omp)
+// ---------------------------------------------------------------------------
+
+const accountEvents = [];
+let accountEventSeq = 0;
+const MAX_ACCOUNT_EVENTS = 100;
+
+function accountSnapshot(id, modelId) {
+  const account = accounts.findAccount(id);
+  if (!account) return null;
+  const q = account.quota?.[modelId] || {};
+  return {
+    id: account.id,
+    email: account.email,
+    project: account.project || accounts.DEFAULT_PROJECT,
+    remainingFraction: q.remainingFraction ?? null,
+    resetTime: q.exhaustedUntil || q.resetTime || null,
+    invalid: Boolean(account.invalid),
+    lastError: account.lastError || null,
+  };
+}
+
+function pushAccountEvent(event) {
+  accountEventSeq += 1;
+  const full = { seq: accountEventSeq, at: new Date().toISOString(), ...event };
+  accountEvents.push(full);
+  if (accountEvents.length > MAX_ACCOUNT_EVENTS) accountEvents.shift();
+
+  const from = full.from?.email || '?';
+  const to = full.to?.email || '?';
+  if (full.type === 'switch') {
+    console.warn(`[agy] troca de conta (${full.model}): ${from} -> ${to} [${full.reason}]`);
+  } else if (full.type === 'recovered') {
+    console.warn(`[agy] conta liberada (${full.model}): voltando para ${to}`);
+  }
+}
+
+async function refreshSnapshots(ids) {
+  for (const id of ids) {
+    if (!id) continue;
+    const account = accounts.findAccount(id);
+    if (!account) continue;
+    try { await accounts.refreshAccountMeta(account); } catch {}
+  }
+}
+
+async function emitSwitchEvent({ fromId, toId, modelId, reason, message }) {
+  try {
+    await refreshSnapshots([fromId, toId]);
+    pushAccountEvent({
+      type: 'switch',
+      model: modelId,
+      reason,
+      message: message || null,
+      from: accountSnapshot(fromId, modelId),
+      to: accountSnapshot(toId, modelId),
+    });
+  } catch (err) {
+    console.warn(`[agy] falha ao registrar troca de conta: ${err.message}`);
+  }
+}
+
+async function emitRecoveredEvent({ accountId, previousActive, modelId }) {
+  try {
+    await refreshSnapshots([accountId, previousActive]);
+    pushAccountEvent({
+      type: 'recovered',
+      model: modelId,
+      reason: 'reset',
+      from: accountSnapshot(previousActive, modelId),
+      to: accountSnapshot(accountId, modelId),
+    });
+  } catch (err) {
+    console.warn(`[agy] falha ao registrar retorno de conta: ${err.message}`);
+  }
+}
+
 /**
  * Tenta as contas do cofre na ordem de preferência. Em 429 de quota, marca a
  * conta como esgotada para aquele modelo e passa para a próxima. 429 genérico
@@ -601,6 +679,7 @@ async function callAccount(body, account) {
 async function postWithAccounts(body, modelId) {
   const tried = new Set();
   let last = null;
+  let pendingSwitch = null;
 
   while (true) {
     const account = accounts.selectAccountsFor(modelId).find((a) => !tried.has(a.id));
@@ -611,12 +690,24 @@ async function postWithAccounts(body, modelId) {
       const out = await callAccount(body, account);
 
       if (out.ok) {
-        accounts.markSuccess(account.id, modelId);
+        const info = accounts.markSuccess(account.id, modelId);
+        if (pendingSwitch && pendingSwitch.fromId !== account.id) {
+          void emitSwitchEvent({ ...pendingSwitch, toId: account.id, modelId });
+        } else if (info.recovered && info.previousActive !== account.id) {
+          void emitRecoveredEvent({
+            accountId: account.id,
+            previousActive: info.previousActive || null,
+            modelId,
+          });
+        }
         return { res: out.res, account };
       }
 
       if (out.tokenError) {
         console.warn(`[agy] conta ${account.email} indisponível (${out.tokenError}); tentando a próxima`);
+        if (!pendingSwitch) {
+          pendingSwitch = { fromId: account.id, reason: 'invalid', message: out.tokenError };
+        }
         last = { statusCode: 502, text: `conta ${account.email}: ${out.tokenError}` };
         break;
       }
@@ -627,10 +718,18 @@ async function postWithAccounts(body, modelId) {
           await sleep(1500 * attempt);
           continue;
         }
+        if (!pendingSwitch) {
+          pendingSwitch = { fromId: account.id, reason: 'error', message: out.networkError };
+        }
         break;
       }
 
-      if (out.invalid) accounts.markInvalid(account.id, out.text.slice(0, 300));
+      if (out.invalid) {
+        accounts.markInvalid(account.id, out.text.slice(0, 300));
+        if (!pendingSwitch) {
+          pendingSwitch = { fromId: account.id, reason: 'invalid', message: out.text.slice(0, 300) };
+        }
+      }
 
       if (out.statusCode === 429) {
         const quota = accounts.parseQuotaExhaustion(out.text);
@@ -643,6 +742,9 @@ async function postWithAccounts(body, modelId) {
         console.warn(
           `[agy] quota de ${modelId} esgotada em ${account.email} (reset ${quota.resetAt}); tentando a próxima conta`
         );
+        if (!pendingSwitch) {
+          pendingSwitch = { fromId: account.id, reason: 'quota', message: quota.message };
+        }
         last = { statusCode: 429, text: out.text };
         break;
       }
@@ -652,6 +754,13 @@ async function postWithAccounts(body, modelId) {
         if (attempt < 2) {
           await sleep(1500 * attempt);
           continue;
+        }
+        if (!pendingSwitch) {
+          pendingSwitch = {
+            fromId: account.id,
+            reason: 'error',
+            message: `HTTP ${out.statusCode}`,
+          };
         }
         break;
       }
@@ -1003,6 +1112,19 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && (url.pathname === '/v1/accounts' || url.pathname === '/accounts')) {
     sendJson(res, 200, { object: 'list', data: accounts.publicList() });
+    return;
+  }
+
+  if (
+    req.method === 'GET' &&
+    (url.pathname === '/v1/accounts/events' || url.pathname === '/accounts/events')
+  ) {
+    const raw = url.searchParams.get('since');
+    const since = raw == null ? -1 : Number(raw);
+    const data = Number.isFinite(since) && since >= 0
+      ? accountEvents.filter((event) => event.seq > since)
+      : [];
+    sendJson(res, 200, { object: 'list', lastSeq: accountEventSeq, data });
     return;
   }
 
