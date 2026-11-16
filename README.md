@@ -364,7 +364,10 @@ The extension only used to start the provider when nothing answered on the port,
 - `GET /health` reports `build` (a sha256 of `server.js` + `lib/accounts.js`), `pid`, and `startedAt`;
 - on every `session_start` the extension compares that `build` with the files on disk;
 - on a mismatch it calls `POST /v1/shutdown`, waits for the port to close, and starts a fresh provider;
-- a provider too old to report `build` also counts as stale; if it refuses to stop, the session shows a notice naming the port to free.
+- a provider too old to answer `/v1/shutdown` is stopped by its listening port instead (`netstat` + `taskkill` on Windows, `lsof` + `SIGTERM` elsewhere), and only after the PID is confirmed to be `node.exe`;
+- the extension keeps its own trail in `~/.provider-agy/extension.log` (`AGY_STATE_DIR`), recording the expected/running build, the restart decision, and every compaction check.
+
+Restarting omp's MCP servers is **not** enough: extensions load with the session, so the handshake runs on the next `session_start` after omp itself restarts.
 
 ### Automatic compaction at 80%
 

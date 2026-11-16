@@ -11,7 +11,7 @@
  * ~/.provider-agy/config.json.
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -37,6 +37,21 @@ function delay(ms) {
   const { promise, resolve } = Promise.withResolvers();
   setTimeout(resolve, ms);
   return promise;
+}
+
+// omp captures extension notices in its own UI and drops console output, so the
+// extension keeps its own trail next to the provider log.
+const LOG_FILE = path.join(STATE_DIR, "extension.log");
+const LOG_MAX_BYTES = 1024 * 1024;
+
+function logLine(text) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    try {
+      if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.truncateSync(LOG_FILE, 0);
+    } catch {}
+    fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${text}\n`);
+  } catch {}
 }
 
 async function isUp() {
@@ -79,7 +94,77 @@ async function shutdownProvider() {
     await delay(200);
     if (!(await isUp())) return true;
   }
+  if (await isUp()) {
+    // A provider from before /v1/shutdown existed cannot stop itself.
+    logLine("shutdown endpoint did not stop the process; falling back to the port owner");
+    killPortOwner();
+    for (let i = 0; i < 25; i++) {
+      await delay(200);
+      if (!(await isUp())) return true;
+    }
+  }
   return !(await isUp());
+}
+
+function providerPort() {
+  try {
+    const url = new URL(BASE);
+    return Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  } catch {
+    return 8788;
+  }
+}
+
+/** PID listening on the provider port, or null. */
+function portOwnerPid() {
+  const port = providerPort();
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("netstat", ["-ano", "-p", "TCP"], { encoding: "utf8" });
+      for (const line of out.split(/\r?\n/)) {
+        if (!line.includes("LISTENING")) continue;
+        const cols = line.trim().split(/\s+/);
+        const local = cols[1] || "";
+        if (!local.endsWith(`:${port}`)) continue;
+        const pid = Number(cols[cols.length - 1]);
+        if (Number.isInteger(pid) && pid > 0) return pid;
+      }
+      return null;
+    }
+    const out = execFileSync("lsof", ["-ti", `tcp:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    const pid = Number(out.trim().split(/\s+/)[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Kills the process holding the provider port, but only when it is a node
+ * process: a recycled PID must never take an unrelated program down with it.
+ */
+function killPortOwner() {
+  const pid = portOwnerPid();
+  if (!pid) return false;
+  try {
+    if (process.platform === "win32") {
+      const name = execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"], {
+        encoding: "utf8",
+      });
+      if (!/^"node\.exe"/i.test(name.trim())) {
+        logLine(`port owner ${pid} is not node.exe; refusing to kill it`);
+        return false;
+      }
+      execFileSync("taskkill", ["/PID", String(pid), "/F"], { stdio: "ignore" });
+    } else {
+      process.kill(pid, "SIGTERM");
+    }
+    logLine(`killed stale provider pid ${pid}`);
+    return true;
+  } catch (err) {
+    logLine(`could not kill pid ${pid}: ${err?.message ?? err}`);
+    return false;
+  }
 }
 
 /**
@@ -93,17 +178,21 @@ export function providerNeedsRestart(actual, expected) {
   return actual !== expected;
 }
 
-async function ensureProvider() {
+export async function ensureProvider() {
   const dir = providerDir();
   const expected = localBuild(dir);
+  logLine(`ensureProvider dir=${dir} expected=${expected} base=${BASE}`);
 
   if (await isUp()) {
     const actual = await runningBuild();
+    logLine(`provider is up, running build=${actual ?? "none"}`);
     if (!providerNeedsRestart(actual, expected)) {
       return { ok: true, started: false };
     }
+    logLine("build differs from disk; replacing the provider");
     await shutdownProvider();
     if (await isUp()) {
+      logLine("stale provider is still answering after shutdown attempts");
       return {
         ok: false,
         started: false,
@@ -113,9 +202,11 @@ async function ensureProvider() {
           "stop the node process on the provider port and restart omp",
       };
     }
+    logLine("stale provider stopped");
   }
 
   if (!fs.existsSync(path.join(dir, "server.js"))) {
+    logLine(`server.js missing in ${dir}`);
     return { ok: false, error: `server not found in ${dir}` };
   }
 
@@ -127,11 +218,16 @@ async function ensureProvider() {
     env: process.env,
   });
   child.unref();
+  logLine(`spawned provider pid ${child.pid}`);
 
   for (let i = 0; i < 30; i++) {
     await delay(200);
-    if (await isUp()) return { ok: true, started: true };
+    if (await isUp()) {
+      logLine("provider answered /health after spawn");
+      return { ok: true, started: true };
+    }
   }
+  logLine("provider did not answer /health within 6s");
   return { ok: false, error: "the server did not respond within 6s" };
 }
 
@@ -482,7 +578,11 @@ export default function providerAgy(pi) {
     const tokens = Number(usage?.tokens);
     if (!Number.isFinite(tokens) || tokens <= 0) return;
 
-    if (!shouldCompact(tokens, budget)) return;
+    const threshold = budget.maxInputTokens * (budget.compactAtPercent / 100);
+    if (!shouldCompact(tokens, budget)) {
+      logLine(`context ${tokens}/${budget.maxInputTokens} tokens; below the ${budget.compactAtPercent}% threshold (${Math.round(threshold)})`);
+      return;
+    }
 
     compacting = true;
     lastCompactAt = Date.now();
@@ -558,6 +658,7 @@ export default function providerAgy(pi) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    logLine(`session_start mode=${ctx.mode} hasUI=${ctx.hasUI}`);
     const result = await ensureProvider();
     if (!result.ok) {
       if (ctx.hasUI) {
