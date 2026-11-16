@@ -1,174 +1,58 @@
 # provider-agy
 
-Provider **OpenAI-compatible** local que usa o backend do **Antigravity CLI (`agy`)** já logado na sua conta, para codar com o **omp (Oh My Pi)** e outros clientes que falem OpenAI Chat Completions.
+An **OpenAI-compatible** local provider that uses the backend of the **Antigravity CLI (`agy`)** and the account already signed in there. It works with **omp (Oh My Pi)** and any client that speaks OpenAI Chat Completions.
 
-O cliente fala com um servidor local; o servidor traduz para o mesmo protocolo que o `agy` usa no Cloud Code do Google. Nenhum header de “cliente alternativo” é inventado: o fingerprint HTTP replica o do `agy`.
+The provider translates requests to the same Cloud Code protocol used by `agy`. It does not invent an "alternative client" fingerprint: the HTTP envelope, headers, and labels mirror `agy` 1.5.9.
 
-> Projeto não oficial, sem vínculo com o Google. Use por sua conta e risco.
+> Unofficial project, not affiliated with Google. Use at your own risk.
 
-## Como funciona
+## Highlights
 
-1. Lê o token OAuth da mesma entrada de keyring do `agy` (`gemini:antigravity`) e guarda uma cópia em um cofre local multi-contas.
-2. Quando o access token expira, renova com o client OAuth do `agy` (configurado localmente, fora do repositório) e salva o token renovado no cofre.
-3. Envia `POST https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` com:
-   - o mesmo `User-Agent` do `agy` (`antigravity/cli/1.5.9 (...)`),
-   - o mesmo envelope (`project`, `requestId`, `request`, `model`, `userAgent`, `requestType`),
-   - os mesmos `labels` internos (`model_enum`, `cascade_id`, `trajectory_id`, etc.),
-   - `generationConfig` por modelo (`thinkingLevel` no Gemini, `thinkingBudget` no Claude/GPT-OSS).
-4. Traduz mensagens e tools entre OpenAI e o formato Gemini/Claude do Cloud Code, preservando:
-   - `functionCall.id` e `functionResponse.id` (obrigatórios no Claude),
-   - `thoughtSignature` (obrigatório no Gemini 3 em turnos com tool call), persistido em `~/.provider-agy/state.json` para sobreviver a reinícios,
-   - streaming SSE, tool calls, `reasoning_content` e usage.
+- **No server to start by hand.** The included omp extension launches the provider on the first session and keeps it running in the background.
+- **Multi-account vault.** Import every account you sign in to with `agy`; the current keyring token is never lost.
+- **Automatic failover per model.** If Gemini runs out of quota, another account takes over. Claude quota is tracked separately.
+- **Returns to the previous account.** Once an exhausted account reaches its reset time, it goes back to the front of the queue.
+- **Visible status.** Account switches, recoveries, a periodic account banner, and a red global block notice appear in the omp UI.
+- **Hard stop on bans.** A ban, suspension, or terms violation blocks every account and stops all attempts until you manually unlock it.
 
-Sessões criadas antes da persistência, ou cujo tool call antigo não tem assinatura, têm esse par `functionCall`/`functionResponse` descartado no reenvio ao Gemini em vez de devolver 400.
+## Requirements
 
-## Requisitos
+- **Windows** with `agy` installed and signed in. Verify with:
+  ```bash
+  agy -p "ok"
+  ```
+- **Node.js 18+** (tested with Node 24).
+- **omp 18.x** (optional; another OpenAI-compatible client also works).
+- An OAuth client for token refresh. See [OAuth client](#oauth-client).
 
-- **Windows** com `agy` instalado e **logado** (`agy -p "ok"` deve responder). A leitura do keyring usa a API de Credenciais do Windows.
-- Node.js 18+ (testado com Node 24).
-- `omp` 18.x (opcional; qualquer cliente OpenAI-compatible serve).
+No `npm install` is required: the project has no external dependencies.
 
-## Configuração rápida com um agente do omp
-
-Copie o prompt abaixo e cole em uma sessão do omp (de preferência com a pasta deste projeto como diretório de trabalho). Ele foi escrito para um agente com acesso ao shell configurar o provider, a extensão, as contas e validar tudo:
-
-```text
-Configure o provider-agy nesta máquina e deixe o omp pronto para usá-lo.
-
-Contexto: este é o repositório do provider-agy (se não estiver nele, clone
-https://github.com/dilneiss/omp-agy-provider-proxy.git). O provider é
-OpenAI-compatible em http://127.0.0.1:8788/v1 e sobe automaticamente pelo omp
-graças a uma extensão.
-
-Faça, nesta ordem:
-
-1. Confirme que o agy está instalado e logado com `agy -p "ok"`. Se falhar,
-   pare e me peça para autenticar com `agy acp --login`.
-2. Verifique se existe ~/.provider-agy/oauth.json ou se AGY_OAUTH_CLIENT_ID e
-   AGY_OAUTH_CLIENT_SECRET estão definidos. Se não existirem, me peça os
-   valores do client OAuth embutido no agy; não invente valores, não imprima
-   segredos e crie o arquivo com permissão restrita.
-3. Rode `npm run install:omp` para instalar a extensão de auto-start.
-4. Garanta em ~/.omp/agent/models.yml um provider `agy` com:
-   baseUrl: http://127.0.0.1:8788/v1
-   api: openai-completions
-   auth: none
-   e os modelos gemini-3.8-flash-high/medium/low (contextWindow 1048576,
-   maxTokens 65536), claude-sonnet-4-6 e claude-opus-4-6-thinking
-   (contextWindow 250000, maxTokens 64000), gpt-oss-120b-medium
-   (contextWindow 131072, maxTokens 32768). Faça backup antes de editar.
-5. Rode `npm run accounts -- add` e depois `npm run accounts -- list`.
-6. Suba o provider com `npm start` em background, espere /health responder e
-   teste um POST em /v1/chat/completions com o modelo gemini-3.8-flash-high.
-7. Rode `omp models agy` e confirme que os 6 modelos aparecem.
-8. Não faça commit de accounts.json, oauth.json, state.json, tokens ou logs.
-   Não exponha e-mails, tokens ou quotas reais na sua resposta.
-
-No final, resuma: contas importadas, quota por modelo, se o auto-start está
-instalado e o resultado do teste de geração.
-```
-
-## Instalação
+## Quick start
 
 ```bash
 git clone https://github.com/dilneiss/omp-agy-provider-proxy.git
 cd omp-agy-provider-proxy
-npm start
 ```
 
-Não há dependências externas: `npm start` roda direto com o Node. Na primeira execução, o provider importa automaticamente a conta que estiver logada no `agy`.
-
-O servidor escuta em `http://127.0.0.1:8788/v1`. Para parar, use `Ctrl+C`.
-
-### Configurar o client OAuth
-
-O refresh do token usa o mesmo client OAuth embutido no binário do `agy`. Essas credenciais **não ficam neste repositório**; configure uma das opções abaixo:
-
-**Opção A — arquivo local (recomendado):** crie `~/.provider-agy/oauth.json`:
-
-```json
-{
-  "clientId": "<id>.apps.googleusercontent.com",
-  "clientSecret": "GOCSPX-<secret>"
-}
-```
-
-**Opção B — variáveis de ambiente:**
-
-```bash
-AGY_OAUTH_CLIENT_ID='<id>.apps.googleusercontent.com' \
-AGY_OAUTH_CLIENT_SECRET='GOCSPX-<secret>' \
-npm start
-```
-
-Os dois valores estão embutidos no executável do `agy` instalado na sua máquina. Localize o binário com `where agy` (Windows) e extraia as strings `*.apps.googleusercontent.com` e `GOCSPX-...` com a ferramenta que preferir (`strings`, editor hexadecimal etc.). O arquivo `oauth.json` fica fora do repositório e é ignorado pelo Git.
-
-Sem essas credenciais o provider continua funcionando com o access token atual até ele expirar; depois disso o refresh falha com uma mensagem explicando o que configurar.
-
-O cofre de contas e o `oauth.json` ficam em `~/.provider-agy/` (ou em `AGY_STATE_DIR`).
-
-## Uso com o omp
-
-Em um terminal, deixe o provider rodando:
-
-```bash
-npm start
-# ou, no Windows:
-start.cmd
-```
-
-Em outro terminal:
-
-```bash
-omp --model agy/gemini-3.8-flash-high
-```
-
-Ou use o launcher que sobe o provider se necessário e abre o omp:
-
-```bash
-omp-agy.cmd
-```
-
-### Iniciar o provider automaticamente pelo omp
-
-O `models.yml` do omp não inicia servidores, mas o omp carrega extensões. Este projeto inclui uma extensão que sobe o provider na primeira sessão e mostra os avisos de troca de conta:
+### 1. Install the omp extension
 
 ```bash
 npm run install:omp
 ```
 
-O instalador:
+The installer copies the extension to `~/.omp/agent/extensions/provider-agy.ts` and records this project path in `~/.provider-agy/config.json`. Restart omp after installing.
 
-- copia `omp-extension/provider-agy.ts` para `~/.omp/agent/extensions/`;
-- grava o caminho deste projeto em `~/.provider-agy/config.json`.
+On the next session the extension starts the provider automatically. You do **not** need to run `npm start` or keep a terminal open.
 
-Reinicie o omp. Na próxima sessão, se o provider ainda não estiver rodando, a extensão executa `node server.js` em segundo plano e avisa no omp. Se já estiver rodando, ela apenas se conecta. O servidor fica ativo depois que o omp fecha, para a próxima sessão e para outros clientes.
+### 2. Register the provider in omp
 
-Para descobrir os modelos:
-
-```bash
-omp models agy
-```
-
-Modelos expostos (os mesmos `agy models`):
-
-| id | nome | contexto | saída |
-|---|---|---|---|
-| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | 1M | 64K |
-| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | 1M | 64K |
-| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | 1M | 64K |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | 250K | 64K |
-| `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | 250K | 64K |
-| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | 128K | 32K |
-
-### Registrar no omp
-
-Registre um provider no `~/.omp/agent/models.yml` apontando para `http://127.0.0.1:8788/v1` com `api: openai-completions` e os ids da tabela acima. Exemplo de bloco (ajuste ao formato da sua versão do omp):
+Add this block to `~/.omp/agent/models.yml` (adjust it to the format of your omp version):
 
 ```yaml
 agy:
   baseUrl: http://127.0.0.1:8788/v1
   api: openai-completions
+  auth: none
   models:
     - gemini-3.8-flash-high
     - gemini-3.8-flash-medium
@@ -178,389 +62,481 @@ agy:
     - gpt-oss-120b-medium
 ```
 
-Para tornar o modelo padrão do omp:
+Then check the model list:
+
+```bash
+omp models agy
+```
+
+Use it directly:
+
+```bash
+omp --model agy/gemini-3.8-flash-high
+```
+
+Or make it the default model:
 
 ```bash
 omp config set modelRoles '{"default":"agy/gemini-3.8-flash-high"}'
 ```
 
-> Isso faz todo `omp` depender do provider local estar rodando. Se preferir, use `--model agy/...` só quando quiser.
-
-## Multi-contas e fallback automático
-
-O provider mantém um cofre local em `~/.provider-agy/accounts.json` com todas as contas que você importar. O keyring do `agy` continua sendo a fonte da conta “atual”; o cofre é independente e guarda as demais.
-
-Ao subir, o provider importa automaticamente a conta que estiver no keyring. Assim você pode trocar de conta no `agy` sem perder o token que já estava salvo.
-
-### Adicionar outra conta sem perder a atual
+### 3. Import your first account
 
 ```bash
-# 1. guarda a conta logada agora
 npm run accounts -- add
-
-# 2. entre na outra conta pelo próprio agy (/login na TUI ou agy acp --login)
-
-# 3. importa a nova conta; a anterior continua no cofre
-npm run accounts -- add
-
-# 4. confira
 npm run accounts -- list
 npm run accounts -- quota
 ```
 
-O comando é idempotente: importar a mesma conta de novo atualiza o token dela em vez de criar duplicata.
+The first `omp` session starts the provider; no separate server command is needed.
 
-### Comandos de contas
+## How it works
 
-| comando | efeito |
-|---|---|
-| `npm run accounts -- list` | lista contas, projeto e quota; marca a ativa com `*` |
-| `npm run accounts -- add [nome]` | importa a conta logada no `agy` para o cofre |
-| `npm run accounts -- use <email-ou-índice>` | faz o `agy` usar essa conta (grava o blob no keyring) |
-| `npm run accounts -- remove <email-ou-índice>` | remove do cofre sem mexer no keyring |
-| `npm run accounts -- unblock` | libera o provider depois de um bloqueio por banimento/suspensão |
-| `npm run accounts -- quota` | consulta a quota real de cada conta e modelo |
-| `npm run accounts -- login` | mostra o passo a passo acima |
-| `npm run quota` | atalho de diagnóstico de quota usando o cofre inteiro |
+1. Reads the OAuth token from the same Windows keyring entry used by `agy` (`gemini:antigravity`).
+2. Stores a copy of each account in a local vault at `~/.provider-agy/accounts.json`, outside the repository.
+3. Refreshes expired tokens with the OAuth client configured locally.
+4. Sends requests to Cloud Code with the same user agent, envelope, labels, and per-model generation config as `agy`.
+5. Translates messages and tools between OpenAI and the Gemini/Claude format, preserving:
+   - `functionCall.id` and `functionResponse.id` (required by Claude);
+   - `thoughtSignature` (required by Gemini 3 on tool-call turns), persisted in `~/.provider-agy/state.json`;
+   - SSE streaming, tool calls, `reasoning_content`, and usage.
 
-Exemplos:
+If an old tool call has no stored signature, the provider drops that call/result pair instead of returning a 400 from Gemini.
+
+## Models
+
+| ID | Name | Context | Max output |
+|---|---|---|---|
+| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | 1M | 64K |
+| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | 1M | 64K |
+| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | 1M | 64K |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | 250K | 64K |
+| `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | 250K | 64K |
+| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | 128K | 32K |
+
+## Accounts and automatic failover
+
+The `agy` keyring holds one account at a time. The provider vault keeps all imported accounts, so you can switch accounts in `agy` without losing earlier tokens.
+
+### Add another account
 
 ```bash
+# 1. Save the account currently signed in
 npm run accounts -- add
-npm run accounts -- add trabalho
+
+# 2. Sign in to the other account in agy
+#    Use /login in the TUI or: agy acp --login
+
+# 3. Import the new account
+npm run accounts -- add
+
+# 4. Inspect both accounts
 npm run accounts -- list
-npm run accounts -- use 2
-npm run accounts -- use conta@exemplo.com
-npm run accounts -- remove conta@exemplo.com
+npm run accounts -- quota
 ```
 
-Saída típica do `list` (dados apenas ilustrativos):
+Importing the same account again updates its token instead of creating a duplicate.
+
+### Commands
+
+| Command | Effect |
+|---|---|
+| `npm run accounts -- list` | List accounts, project, and quota; `*` marks the active account. |
+| `npm run accounts -- add [label]` | Import the account currently signed in to `agy`. |
+| `npm run accounts -- use <email-or-index>` | Make `agy` use that account (writes the keyring). |
+| `npm run accounts -- remove <email-or-index>` | Remove it from the vault without touching the keyring. |
+| `npm run accounts -- quota` | Fetch live quota for every account and model. |
+| `npm run accounts -- unblock` | Clear a ban/suspension block. |
+| `npm run accounts -- login` | Show the add-account walkthrough. |
+| `npm run quota` | Read-only quota diagnostic for the whole vault. |
+
+Example:
 
 ```text
-Contas no cofre (2):
-* 1. conta-a@exemplo.com
-     projeto: aicode-consumers
-     quota: flash-high=95% sonnet-4-6=0%
-  2. conta-b@exemplo.com
-     projeto: aicode-consumers
+Vault accounts (2):
+* 1. account-a@example.com
+     project: aicode-consumers
+     requests: 42
+     quota: flash-high=84% sonnet-4-6=0%
+  2. account-b@example.com
+     project: aicode-consumers
+     quota: flash-high=100% sonnet-4-6=97%
 
-* = conta ativa no provider
+* = active provider account
 ```
 
-### Como o roteamento funciona
+The quota view is a per-account report with visual bars, remaining percentage, reset time, and a count of available models:
 
-- O provider tenta primeiro uma conta cujo **reset já passou**; se não houver, tenta a **conta ativa**. Se ela responder, continua ativa (sticky).
-- Quando o horário de reset de uma conta esgotada passa, ela volta para a frente da fila na próxima requisição. Se ainda estiver sem quota, recebe outro 429 e o provider segue para a próxima.
-- Em **429 de quota** (`QUOTA_EXHAUSTED`, `quotaResetTimeStamp` ou mensagem de “individual quota”), a conta é marcada como esgotada **para aquele modelo** até o horário de reset e o provider tenta a próxima conta automaticamente.
-- O fallback é **por modelo**: Claude esgotado não impede o Gemini, e vice-versa.
-- Se a conta responder com sucesso, ela vira a ativa e a marcação de esgotada é removida.
-- Um **429 genérico** (sem detalhes de quota, típico de entrada grande no Gemini) **não** troca de conta: trocar não resolveria e queimaria as demais.
-- Um **401** força o refresh do token daquela conta e repete uma vez. Se continuar inválida, a conta é marcada como inválida e o provider passa para a próxima.
-- **5xx** tem um retry por conta antes de passar para a próxima.
-- Se todas as contas estiverem sem quota, a resposta é `429` com o horário da próxima liberação. Se não houver nenhuma conta utilizável, é `503`.
+```text
+provider-agy quotas
+2 accounts · updated 11/16 00:40
 
-O status das contas aparece em:
+● 1. account-a@example.com  ACTIVE · 3/6 models available
+   project aicode-consumers
+   ────────────────────────────────────────────────────────────────────────────────────
+   MODEL                           QUOTA             LEFT  RESET
+   Gemini 3.8 Flash · High         █████████████░░░    84%  11/16 04:20 (in 3h 41min)
+   Claude Sonnet 4.6               ░░░░░░░░░░░░░░░░     0%  11/16 03:52 (in 3h 13min)
+
+● healthy  ● attention  ● exhausted  ○ no data
+The provider uses the active account first and switches automatically when a quota runs out.
+```
+
+### Routing rules
+
+- Accounts whose reset time has passed are tried first. Otherwise the active account is tried first and stays active after a success (sticky).
+- A quota `429` (`QUOTA_EXHAUSTED`, `quotaResetTimeStamp`, or "individual quota") marks the account exhausted for that model until the reset time and moves to the next account.
+- Failover is per model: exhausted Claude quota does not block Gemini, and vice versa.
+- A successful response clears the exhausted marker and makes that account active.
+- A generic `429` without quota details (for example, a large Gemini input) does not switch accounts.
+- A `401` refreshes the token and retries once. If it still fails, the account is marked invalid and the next one is tried.
+- `5xx` gets one retry per account before moving on.
+- If every account is out of quota, the response is `429` with the next reset time. If no account is usable, it is `503`.
+
+Check status at any time:
 
 ```bash
 curl http://127.0.0.1:8788/health
 curl http://127.0.0.1:8788/v1/accounts
 ```
 
-### Banimento, suspensão e bloqueio global
+## Ban, suspension, and global block
 
-O provider valida os erros do Cloud Code (tanto HTTP quanto eventos SSE) antes de tentar outra conta. Se a mensagem indicar banimento, suspensão, conta desativada, violação de termos ou abuso, ele:
+The provider checks Cloud Code errors in both HTTP responses and SSE events. If the message indicates a ban, suspension, disabled account, terms violation, or abuse, it:
 
-- **para imediatamente** a requisição e **não tenta nenhuma outra conta**;
-- grava o bloqueio em `~/.provider-agy/accounts.json`, então ele sobrevive a reinícios do provider;
-- registra um evento `blocked` e a extensão mostra um aviso em **vermelho** (`error`) na TUI do omp;
-- passa a responder `403` em todas as novas requisições, sem chamar o Google.
+- stops the request immediately and does **not** try another account;
+- stores the block in `~/.provider-agy/accounts.json`, so it survives provider restarts;
+- emits a `blocked` event and shows a red notice in the omp UI;
+- returns `403` for every new request without calling Google.
 
-Exemplo do aviso:
+Example notice:
 
 ```text
-🛑 BLOQUEIO DE CONTAS — provider parado
-Conta: conta-a@exemplo.com
-Motivo: Your account has been suspended for violating the Terms of Service
-Desde: 16/11/2026, 00:21
-Nenhuma conta será tentada. Resolva a situação com o Google e rode:
-npm run accounts -- unblock
+🚨 ACCOUNT BLOCK · ALL ATTEMPTS STOPPED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👤 Account   account-a@example.com
+🛑 Reason    Your account has been suspended for violating the Terms of Service
+🕒 Since     11/16 12:21
+⚠️ Action    no accounts will be tried
+🔓 Fix       resolve it with Google, then run:
+   npm run accounts -- unblock
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Depois de resolver com o Google, libere manualmente:
+After resolving the issue:
 
 ```bash
 npm run accounts -- unblock
 npm run accounts -- list
 ```
 
-O estado também aparece em `GET /health` e `GET /v1/accounts` no campo `blocked` (ou `null`). Erros de quota, 429 por entrada grande e bloqueios de safety do modelo **não** disparam esse bloqueio — só padrões de banimento/suspensão/violação.
+Quota errors, large-input `429`s, and model safety blocks do **not** trigger the global block.
 
-### Avisos de troca de conta no omp
+## omp notices
 
-A extensão consulta `GET /v1/accounts/events` a cada 2 segundos e mostra uma notificação na TUI quando a conta muda. Exemplo:
+The extension polls `/v1/accounts/events` every two seconds.
 
-```text
-provider-agy trocou de conta (claude-sonnet-4-6)
-Motivo: quota esgotada
-De: conta-a@exemplo.com | 0% restante | reset: 16/11/2026 03:52
-Para: conta-b@exemplo.com | 85% restante | reset: 16/11/2026 04:20
-```
-
-Quando a conta anterior é liberada e o provider volta para ela:
+When an account is switched:
 
 ```text
-provider-agy: conta liberada, voltando para conta-a@exemplo.com
-Modelo: claude-sonnet-4-6
-Quota atual: 100% restante | reset: 16/11/2026 05:20
+🔄 ACCOUNT SWITCH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🤖 Model     claude-sonnet-4-6
+📌 Reason    quota exhausted
+⬅️ From      account-a@example.com
+   🔴 0% remaining  ░░░░░░░░░░ · reset 11/16 03:52 (in 3h 13min)
+➡️ To        account-b@example.com
+   🟢 85% remaining  █████████░ · reset 11/16 04:20 (in 3h 41min)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-O motivo pode ser `quota`, `invalid` (token/conta recusados), `error` (falha temporária) ou `blocked` (banimento/suspensão, mostrado em vermelho). As quotas do aviso são atualizadas no momento da troca; se a consulta falhar, aparece a última leitura conhecida ou “sem leitura”. Os avisos aparecem apenas em sessões interativas do omp; em `-p`/RPC eles não são exibidos. Ao abrir uma sessão com o provider já bloqueado, a extensão mostra o aviso vermelho na hora.
+When the previous account is recovered:
 
-O mesmo histórico fica disponível para qualquer cliente:
+```text
+✅ ACCOUNT RECOVERED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎉 Active    account-a@example.com
+🤖 Model     claude-sonnet-4-6
+🎯 Quota     🟢 100% remaining  ██████████
+⏳ Reset     11/16 05:20 (in 4h 41min)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Every **10 successful requests**, the provider refreshes quota and emits a status event with a token summary for that window. The window includes input, output, total, average per request, the input/output share, and how much of the model context the last prompt used:
+
+```text
+📊 PROVIDER-AGY · ACCOUNT PULSE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👤 Account   account-a@example.com
+🤖 Model     gemini-3.8-flash-high
+🎯 Quota     🟢 84% remaining  ████████░░
+⏳ Reset     11/16 04:20 (in 3h 41min)
+📨 Requests  10 this window · 42 on account
+🧠 Tokens    392,600 total this window
+   📥 Input 382,400 (97.4%) · 📤 Output 10,200 (2.6%)
+   📈 Average 39,260/request
+   🧮 Last prompt 38,000 · 3.6% of 1.0M context
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+The total includes thinking tokens when the backend reports them, so input plus output may not add up to 100%; the remaining share is shown as `Thinking`. The window resets after each status event. The request counter and event cursor reset when the provider restarts.
+
+Change the interval with `AGY_STATUS_EVERY`. Notices are shown only in interactive omp sessions, not in `-p` or RPC mode.
+
+The same event history is available to any client:
 
 ```bash
 curl 'http://127.0.0.1:8788/v1/accounts/events?since=0'
-# since=-1 retorna só o cursor atual, sem eventos antigos
+# since=-1 returns only the current cursor
 curl 'http://127.0.0.1:8788/v1/accounts/events?since=-1'
 ```
 
-### Status periódico da conta
+## Limits and context trimming
 
-A cada **10 requisições bem-sucedidas**, o provider atualiza a quota e emite um evento `status`. A extensão mostra um banner de acompanhamento:
+Context window, input limit, and quota are different limits:
 
-```text
-📊 provider-agy — status da conta (10 requisições)
-Conta: conta-a@exemplo.com
-Modelo: gemini-3.8-flash-high
-Quota: 83% restante | reset: 16/11/2026, 04:20
-Requisições nesta conta: 42
-```
-
-O contador é por processo do provider; `Requisições nesta conta` é o total acumulado daquela conta no cofre. Para mudar o intervalo (por exemplo, para testar a cada 1):
-
-```bash
-AGY_STATUS_EVERY=1 npm start
-```
-
-O padrão é `10`. O status também aparece no log do provider e em `GET /v1/accounts/events`.
-
-### Cofre e segurança dos tokens
-
-- Arquivo: `~/.provider-agy/accounts.json` (ou `AGY_STATE_DIR/accounts.json`).
-- Guarda token de acesso, refresh token, e-mail de identificação, projeto e quota de cada conta.
-- No Windows, o arquivo recebe ACL restrita ao seu usuário (`icacls`).
-- O cofre fica **fora do repositório** e `accounts.json`/`state.json`/`oauth.json` estão no `.gitignore`. Nunca faça commit dele.
-- `npm run accounts -- use` é a única operação que altera o keyring do `agy`; o uso normal do provider não mexe nele.
-
-## Limites: contexto, requisição e quota
-
-Há três limites diferentes — não confunda a janela de contexto com a cota:
-
-| limite | valor observado |
+| Limit | Value |
 |---|---|
-| Janela de contexto Gemini 3.8 Flash | **1.048.576** tokens (1M) |
-| Janela de contexto Claude Sonnet/Opus 4.6 | **250.000** tokens |
-| Janela de contexto GPT-OSS 120B | **131.072** tokens (128K) |
-| Saída máxima Gemini / Claude / GPT-OSS | 65.536 / 64.000 / 32.768 |
-| Entrada por requisição na rota Cloud Code | **~40k tokens** (acima disso: 429) |
-| Quota | por modelo, com `remainingFraction` e `resetTime` |
+| Gemini 3.8 Flash context | 1,048,576 tokens |
+| Claude Sonnet/Opus 4.6 context | 250,000 tokens |
+| GPT-OSS 120B context | 131,072 tokens |
+| Max output: Gemini / Claude / GPT-OSS | 65,536 / 64,000 / 32,768 |
+| Cloud Code input per request | ~40k tokens (above that: 429) |
+| Quota | Per account and model, with `remainingFraction` and `resetTime` |
 
-O limite de ~40k tokens não é a janela do modelo: é um teto prático da rota/plano. Nos testes, ~140k caracteres (~39,8k tokens) passaram e ~160k (~45k) falharam, mesmo com quota sobrando. Um prompt cheio de skills/MCP no omp pode chegar a ~174 KB (~46k tokens), então não passaria sem ajuste.
+The ~40k limit is a practical route/plan ceiling, not the model context window. A full omp prompt with many skills and MCP entries can exceed it.
 
-Para consultar a quota real (não gasta quota de geração):
+To fit the route, the provider applies a conservative input budget (`AGY_MAX_INPUT_TOKENS`, default **38,000**):
 
-```bash
-npm run quota
-# ou
-npm run accounts -- quota
-```
+- removes whole old turns without splitting `functionCall`/`functionResponse`;
+- if needed, truncates the **tail** of the system prompt (skills/MCP catalog) while preserving the main instructions at the beginning;
+- logs the adjustment and continues.
 
-O backend informa `remainingFraction` e `resetTime` por modelo. Modelos sem `remainingFraction` estão com 0 restante até o reset informado. O mesmo Claude esgotado retorna 429 também no `agy` oficial (`agy --model claude-sonnet-4-6 -p='OK'`); o `agy` continua funcionando no Gemini porque a quota é separada por modelo.
-
-### Ajuste automático de contexto
-
-Para funcionar com o omp cheio de skills, o provider impõe um orçamento conservador (padrão **38k tokens**):
-
-- remove turnos antigos inteiros (sem quebrar pares `functionCall`/`functionResponse`);
-- se ainda faltar espaço, trunca a **cauda** do system prompt (catálogo de skills/MCP), preservando o começo, que contém as instruções principais;
-- registra o ajuste no stderr e segue.
-
-Se você não precisa de todas as skills/MCP no omp, isso também reduz bastante o prompt:
+If you do not need every skill or MCP server, this also keeps prompts smaller:
 
 ```bash
 omp --model agy/claude-sonnet-4-6 --no-skills --no-rules --no-context-files --no-extensions
 ```
 
-## Variáveis de ambiente
-
-| variável | padrão | efeito |
-|---|---|---|
-| `AGY_PROVIDER_HOST` | `127.0.0.1` | endereço local do servidor |
-| `AGY_PROVIDER_PORT` | `8788` | porta local |
-| `AGY_PROVIDER_URL` | `http://127.0.0.1:8788` | URL usada pela extensão do omp |
-| `AGY_STATUS_EVERY` | `10` | intervalo de requisições para o banner de status da conta |
-| `AGY_PROVIDER_DIR` | lido de `~/.provider-agy/config.json` | pasta do provider que a extensão deve iniciar |
-| `AGY_NODE` | `node` | executável usado pela extensão para subir o servidor |
-| `AGY_MAX_INPUT_TOKENS` | `38000` | orçamento de tokens de entrada por requisição |
-| `AGY_TRIM` | `1` | `0` desabilita o ajuste de contexto (pode tomar 429) |
-| `AGY_PROJECT` | `aicode-consumers` | projeto enviado ao Cloud Code |
-| `AGY_STATE_DIR` | `~/.provider-agy` | cofre de contas, `oauth.json` e assinaturas de tool calls |
-| `AGY_ACCESS_TOKEN` | — | usa um token fixo e ignora keyring/cofre |
-| `AGY_KEYRING_TARGET` | `gemini:antigravity` | entrada do Credential Manager usada pelo `agy` |
-| `AGY_OAUTH_CLIENT_ID` | — | client OAuth usado no refresh (ou use `oauth.json`) |
-| `AGY_OAUTH_CLIENT_SECRET` | — | secret OAuth usado no refresh (ou use `oauth.json`) |
-| `AGY_CLOUD_CODE_HOST` | `daily-cloudcode-pa.googleapis.com` | host do Cloud Code |
-| `AGY_DEBUG_FC` | — | `1` loga os `functionCall` recebidos |
-
-## Verificação rápida
+Check live quota without consuming generation quota:
 
 ```bash
-# credencial do agy funcionando?
-agy -p "ok"
-
-# servidor e contas
-curl http://127.0.0.1:8788/health
-curl http://127.0.0.1:8788/v1/accounts
-curl http://127.0.0.1:8788/v1/accounts/events?since=-1
-curl http://127.0.0.1:8788/v1/models
-
-# request não-streaming
-curl -s -X POST http://127.0.0.1:8788/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"Responda apenas OK"}],"stream":false}'
-
-# request streaming
-curl -N -X POST http://127.0.0.1:8788/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"Responda apenas OK"}],"stream":true}'
+npm run accounts -- quota
+npm run quota
 ```
 
-Fluxos validados neste projeto:
+## OAuth client
 
-- leitura, criação e edição de arquivos via tool calls com Gemini e Claude;
-- streaming SSE, `functionCall`, `functionResponse`, `thoughtSignature` e usage;
-- importação de conta do keyring para o cofre;
-- fallback automático quando a conta ativa está inválida;
-- evento de troca de conta com conta anterior, motivo, reset e quota da conta nova;
-- retorno prioritário à conta anterior depois do horário de reset;
-- bloqueio global imediato ao detectar banimento/suspensão, sem tentar outra conta, com aviso vermelho e `unblock` manual;
-- banner periódico de status da conta a cada 10 requisições, com quota e reset atualizados;
-- nenhuma janela de terminal visível: keyring e `icacls` rodam ocultos, e o `icacls` não é repetido a cada gravação;
-- início automático do provider pela extensão do omp, inclusive com o servidor parado (`omp -p` respondeu sem `npm start`);
-- resposta 429 com horário de reset quando todas as contas estão sem quota para o modelo.
+Token refresh uses the same OAuth client embedded in the `agy` binary. These credentials are **not distributed in this repository**.
 
-## Diagnóstico
+**Option A: local file (recommended)**
 
-| sintoma | causa provável | o que fazer |
+Create `~/.provider-agy/oauth.json`:
+
+```json
+{
+  "clientId": "<id>.apps.googleusercontent.com",
+  "clientSecret": "GOCSPX-<secret>"
+}
+```
+
+**Option B: environment variables**
+
+```bash
+AGY_OAUTH_CLIENT_ID='<id>.apps.googleusercontent.com'
+AGY_OAUTH_CLIENT_SECRET='GOCSPX-<secret>'
+```
+
+Both values are embedded in the `agy` executable installed on your machine. Find the binary with `where agy` and extract the `*.apps.googleusercontent.com` and `GOCSPX-...` strings with the tool of your choice (`strings`, a hex editor, and so on). The `oauth.json` file lives outside the repository and is ignored by Git.
+
+Without these credentials, the provider still works with the current access token until it expires. After that, refresh fails with a message explaining what to configure.
+
+## Gemini account authentication
+
+`agy` owns authentication; the provider only imports the token already stored in the keyring.
+
+### First account
+
+```bash
+agy
+# inside the TUI:
+#   /login
+# choose the Google account with Antigravity/Gemini Code Assist access
+
+# alternative without the TUI:
+agy acp --login
+
+# verify
+agy -p "ok"
+
+# import into the provider vault
+npm run accounts -- add
+npm run accounts -- list
+npm run quota
+```
+
+### Add another account without losing the first
+
+```bash
+npm run accounts -- add
+agy
+# inside the TUI: /login and choose the other Google account
+
+agy -p "ok"
+npm run accounts -- add
+npm run accounts -- list
+npm run quota
+```
+
+Make `agy` use a specific vault account:
+
+```bash
+npm run accounts -- use account@example.com
+# or use the index from the list:
+npm run accounts -- use 2
+agy -p "ok"
+```
+
+### Expired or revoked token
+
+```bash
+agy acp --login
+npm run accounts -- add
+npm run accounts -- list
+```
+
+Quota is **per account and per model**. The provider switches accounts automatically and returns to the previous account once its reset time passes.
+
+## Environment variables
+
+| Variable | Default | Effect |
 |---|---|---|
-| `CredRead failed` / keyring não encontrado | `agy` não está logado nesta máquina | rode `agy -p "ok"` e faça login |
-| `client OAuth do agy não configurado` | faltam as credenciais de refresh | crie `~/.provider-agy/oauth.json` ou defina `AGY_OAUTH_CLIENT_ID`/`AGY_OAUTH_CLIENT_SECRET` |
-| `invalid_grant` em uma conta | refresh token revogado/expirado | faça login de novo no `agy` e rode `npm run accounts -- add` |
-| `429 QUOTA_EXHAUSTED` | quota do modelo esgotada | aguarde o `resetTime` ou adicione outra conta ao cofre |
-| `429` sem detalhes, em prompt grande | limite de entrada por requisição (~40k tokens) | reduza `AGY_MAX_INPUT_TOKENS`, remova skills/MCP ou diminua o contexto |
-| aviso vermelho de contas bloqueadas | o Google recusou uma conta por banimento/suspensão | resolva com o Google e rode `npm run accounts -- unblock` |
-| `403 BLOQUEIO DE SEGURANÇA` em toda requisição | bloqueio global ativo no cofre | `npm run accounts -- list` e, após resolver, `npm run accounts -- unblock` |
-| `nenhuma conta disponível` | cofre vazio ou todas inválidas | `npm run accounts -- list` e `npm run accounts -- add` |
-| porta 8788 ocupada | outro provider/processo rodando | pare o processo ou use `AGY_PROVIDER_PORT=8790` |
-| provider não sobe sozinho no omp | extensão não instalada ou caminho antigo | rode `npm run install:omp` e reinicie o omp |
-| aviso de troca não aparece | sessão `-p`/RPC ou extensão não carregada | use a TUI e confira `/extensions` no omp |
-| extensão instalada mas servidor não encontra | projeto movido/renomeado | rode `npm run install:omp` de novo |
-| janelas de terminal piscando a cada request | versão antiga rodando `icacls` em cada save | reinicie o provider na versão atual; os subprocessos agora são ocultos e o `icacls` roda no máximo uma vez por arquivo |
+| `AGY_PROVIDER_HOST` | `127.0.0.1` | Local server address |
+| `AGY_PROVIDER_PORT` | `8788` | Local server port |
+| `AGY_PROVIDER_URL` | `http://127.0.0.1:8788` | URL used by the omp extension |
+| `AGY_STATUS_EVERY` | `10` | Successful responses between token/status banners |
+| `AGY_PROVIDER_DIR` | from `~/.provider-agy/config.json` | Project directory the extension should start |
+| `AGY_NODE` | `node` | Node executable used by the extension |
+| `AGY_MAX_INPUT_TOKENS` | `38000` | Input token budget per request |
+| `AGY_TRIM` | `1` | `0` disables context trimming (may hit 429) |
+| `AGY_PROJECT` | `aicode-consumers` | Project sent to Cloud Code |
+| `AGY_STATE_DIR` | `~/.provider-agy` | Vault, `oauth.json`, and tool-call signatures |
+| `AGY_ACCESS_TOKEN` | - | Use a fixed token and ignore keyring/vault |
+| `AGY_KEYRING_TARGET` | `gemini:antigravity` | Credential Manager entry used by `agy` |
+| `AGY_OAUTH_CLIENT_ID` | - | OAuth client for refresh (or use `oauth.json`) |
+| `AGY_OAUTH_CLIENT_SECRET` | - | OAuth secret for refresh (or use `oauth.json`) |
+| `AGY_CLOUD_CODE_HOST` | `daily-cloudcode-pa.googleapis.com` | Cloud Code host |
+| `AGY_DEBUG_FC` | - | `1` logs received `functionCall` parts |
 
-Para parar um processo antigo na porta (Windows):
+## Security
+
+- `accounts.json`, `state.json`, `oauth.json`, tokens, and logs stay outside the repository and are listed in `.gitignore`.
+- The vault stores access tokens, refresh tokens, email identifiers, project, and quota for each account.
+- On Windows, the vault receives an ACL restricted to your user (`icacls`).
+- `npm run accounts -- use` is the only operation that changes the `agy` keyring. Normal provider use does not modify it.
+- Never commit the vault, OAuth client, or logs.
+
+## Quick verification
+
+```bash
+# agy credential
+agy -p "ok"
+
+# provider status
+curl http://127.0.0.1:8788/health
+curl http://127.0.0.1:8788/v1/models
+curl http://127.0.0.1:8788/v1/accounts
+
+# non-streaming request
+curl -s -X POST http://127.0.0.1:8788/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"Reply only OK"}],"stream":false}'
+
+# streaming request
+curl -N -X POST http://127.0.0.1:8788/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"Reply only OK"}],"stream":true}'
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `CredRead failed` / keyring not found | `agy` is not signed in on this machine | Run `agy -p "ok"` and sign in |
+| `agy OAuth client is not configured` | Refresh credentials are missing | Create `~/.provider-agy/oauth.json` or set `AGY_OAUTH_CLIENT_ID`/`AGY_OAUTH_CLIENT_SECRET` |
+| `invalid_grant` on one account | Refresh token revoked or expired | Sign in again with `agy` and run `npm run accounts -- add` |
+| `429 QUOTA_EXHAUSTED` | Model quota is exhausted | Wait for `resetTime` or add another account |
+| Generic `429` on a large prompt | Per-request input limit (~40k tokens) | Lower `AGY_MAX_INPUT_TOKENS`, remove skills/MCP, or reduce context |
+| Red global block notice | Google rejected an account for a ban/suspension | Resolve it with Google and run `npm run accounts -- unblock` |
+| `403 SECURITY BLOCK` on every request | Global block is stored in the vault | Run `npm run accounts -- list`, then `unblock` after resolving it |
+| `no account available` | Empty vault or all accounts invalid | Run `npm run accounts -- list` and `npm run accounts -- add` |
+| Port 8788 already in use | Another provider or process is running | Stop it or set `AGY_PROVIDER_PORT=8790` |
+| Provider does not start in omp | Extension missing or stale project path | Run `npm run install:omp` and restart omp |
+| Switch notices do not appear | `-p`/RPC session or extension not loaded | Use the TUI and check `/extensions` in omp |
+| Terminal windows flashing on each request | Old version running `icacls` on every save | Use the current version; subprocesses are hidden and `icacls` runs at most once per file |
+
+Stop an old process on the port (Windows):
 
 ```bash
 netstat -ano | findstr :8788
 taskkill /PID <pid> /F
 ```
 
-## Estrutura do projeto
+## Project layout
 
 ```text
-server.js                     servidor HTTP, tradução OpenAI <-> Cloud Code, streaming e tools
-lib/accounts.js               cofre multi-contas, refresh OAuth, quota, seleção e fallback
-tools/accounts.js             CLI de contas (list/add/use/remove/quota/login)
-tools/quota.js                diagnóstico de quota usando o cofre
-tools/install-omp.js          instala a extensão que sobe o provider automaticamente
-tools/keyring.ps1             leitura/escrita do Credential Manager do Windows
-omp-extension/provider-agy.ts extensão do omp: auto-start e avisos de troca de conta
-start.cmd                     inicia o provider no Windows
-omp-agy.cmd                   sobe o provider se necessário e abre o omp
+server.js                     HTTP server, OpenAI <-> Cloud Code translation, streaming, tools
+lib/accounts.js               multi-account vault, OAuth refresh, quota, selection, fallback
+tools/accounts.js             account CLI (list/add/use/remove/quota/login/unblock)
+tools/quota.js                read-only quota diagnostic for the vault
+tools/install-omp.js          installs the auto-start omp extension
+tools/keyring.ps1             Windows Credential Manager read/write
+omp-extension/provider-agy.ts omp extension: auto-start and account notices
+start.cmd                     manual server launcher for Windows
+omp-agy.cmd                   legacy launcher that starts the server and opens omp
 ```
 
-## Aviso
+## Set up with an omp agent
 
-- O repositório não contém tokens de conta. O cofre fica na sua pasta de usuário e nunca deve ser commitado.
-- O client OAuth usado é o mesmo embutido no binário distribuído do `agy`, mas **não é distribuído neste repositório**: você o configura em `~/.provider-agy/oauth.json` ou pelas variáveis `AGY_OAUTH_CLIENT_ID`/`AGY_OAUTH_CLIENT_SECRET`.
-- Usar a credencial do Antigravity fora do cliente oficial pode contrariar os termos do serviço. O fingerprint replica o `agy`, mas isso não garante ausência de bloqueios.
-- O limite de ~40k tokens e o formato do Cloud Code são do backend e podem mudar sem aviso.
+Paste this prompt into an omp session, preferably from this project directory:
 
-## Autenticando contas do Gemini
+```text
+Set up provider-agy on this machine and make omp ready to use it.
 
-Quem autentica é o próprio `agy`; o provider apenas importa o token que já está no keyring. O fluxo completo é:
+Context: this is the provider-agy repository (clone
+https://github.com/dilneiss/omp-agy-provider-proxy.git if needed). The provider
+is OpenAI-compatible at http://127.0.0.1:8788/v1 and is started automatically
+by an omp extension. Do not ask me to run a separate server.
 
-### Primeira conta
+Do this in order:
 
-```bash
-# 1. abra o agy e faça login pelo Google
-agy
-# dentro da TUI, rode:
-#   /login
-# escolha a conta Google com acesso ao Antigravity/Gemini Code Assist
+1. Verify that agy is installed and signed in with `agy -p "ok"`. If it fails,
+   stop and ask me to authenticate with `agy acp --login`.
+2. Check whether ~/.provider-agy/oauth.json exists or AGY_OAUTH_CLIENT_ID and
+   AGY_OAUTH_CLIENT_SECRET are set. If missing, ask me for the OAuth client
+   values embedded in agy. Do not invent values, print secrets, or commit them.
+3. Run `npm run install:omp` to install the auto-start extension.
+4. Ensure ~/.omp/agent/models.yml has an `agy` provider with:
+   baseUrl: http://127.0.0.1:8788/v1
+   api: openai-completions
+   auth: none
+   and the models gemini-3.8-flash-high/medium/low, claude-sonnet-4-6,
+   claude-opus-4-6-thinking, and gpt-oss-120b-medium. Back up the file first.
+5. Run `npm run accounts -- add`, then `npm run accounts -- list` and
+   `npm run accounts -- quota`.
+6. Open a new omp session and confirm that the provider starts automatically.
+7. Run `omp models agy` and confirm that all six models appear.
+8. Test a completion with the model gemini-3.8-flash-high.
+9. Do not commit accounts.json, oauth.json, state.json, tokens, or logs. Do not
+   expose real emails, tokens, or quotas in your response.
 
-# alternativa sem TUI (login interativo e sai):
-agy acp --login
-
-# 2. confirme que a conta responde
-agy -p "ok"
-
-# 3. importe para o cofre do provider
-npm run accounts -- add
-npm run accounts -- list
-npm run quota
+Summarize imported accounts, quota by model, auto-start status, and the
+generation test result.
 ```
 
-O `add` guarda no cofre o access token, o refresh token e o e-mail da conta. A partir daí o provider renova o token sozinho e o `agy` pode continuar sendo usado normalmente.
+## Disclaimer
 
-### Adicionar outra conta sem perder a primeira
-
-O keyring do Windows guarda **uma conta por vez**. O cofre é o que preserva as anteriores:
-
-```bash
-# 1. garanta que a conta atual está salva
-npm run accounts -- add
-
-# 2. troque de conta no agy
-agy
-# na TUI: /login e escolha a outra conta Google
-# (se o agy não oferecer troca direta, saia e entre de novo com a outra conta)
-
-# 3. confirme e importe a nova
-agy -p "ok"
-npm run accounts -- add
-
-# 4. veja as duas e suas quotas
-npm run accounts -- list
-npm run quota
-```
-
-O provider passa a alternar sozinho entre elas quando a quota de uma acaba. Para o `agy` voltar a usar uma conta específica do cofre:
-
-```bash
-npm run accounts -- use conta@exemplo.com
-# ou pelo índice mostrado no list:
-npm run accounts -- use 2
-agy -p "ok"
-```
-
-### Conta sem acesso ou token expirado
-
-Se o login do Google não tiver acesso ao Antigravity/Gemini Code Assist, o `agy` falha antes de o provider entrar. Se o refresh token for revogado, o provider marca a conta como inválida e usa outra; para recuperar:
-
-```bash
-agy acp --login          # faça login de novo
-npm run accounts -- add  # atualiza o token da mesma conta no cofre
-npm run accounts -- list # confirme que ela não está mais marcada como inválida
-```
-
-A quota é **por modelo e por conta**. `npm run quota` mostra `remainingFraction` e `resetTime` de cada modelo; quando uma conta esgota, o provider troca e exibe o banner no omp, voltando para a conta anterior assim que o reset passa.
+- The repository contains no account tokens. The vault lives in your home directory and must never be committed.
+- The OAuth client is the same one embedded in the distributed `agy` binary, but it is **not distributed here**: configure it in `~/.provider-agy/oauth.json` or through environment variables.
+- Using Antigravity credentials outside the official client may violate the service terms. Replicating the `agy` fingerprint does not guarantee that an account will never be blocked.
+- The ~40k input limit and the Cloud Code protocol are backend details and may change without notice.

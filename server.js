@@ -2,12 +2,12 @@
 'use strict';
 
 /**
- * provider-agy — expõe o backend do Antigravity CLI (agy) como um provider
- * OpenAI-compatible para o omp (Oh My Pi) e outros clientes.
+ * provider-agy - exposes the Antigravity CLI (agy) backend as an
+ * OpenAI-compatible provider for omp (Oh My Pi) and other clients.
  *
- * A requisição enviada ao Cloud Code replica o envelope, os headers e o
- * formato do agy 1.5.9. A credencial é lida do mesmo keyring usado pelo agy
- * (entrada "gemini:antigravity") e renovada com o client OAuth embutido nele.
+ * Requests sent to Cloud Code replicate the envelope, headers, and request
+ * shape of agy 1.5.9. Credentials are read from the same keyring used by agy
+ * ("gemini:antigravity") and refreshed with its embedded OAuth client.
  */
 
 const http = require('http');
@@ -26,7 +26,7 @@ const PROJECT = process.env.AGY_PROJECT || 'aicode-consumers';
 const HOST = process.env.AGY_PROVIDER_HOST || '127.0.0.1';
 const PORT = Number(process.env.AGY_PROVIDER_PORT || process.env.PORT || 8788);
 
-// "cl" é o changelist de build embutido no binário 1.5.9; mantém o UA idêntico.
+// "cl" is the build changelist embedded in the 1.5.9 binary; keeps the UA identical.
 const CLIENT_CHANGELIST = process.env.AGY_CLIENT_CHANGELIST || '1021519450';
 const USER_AGENT = `antigravity/cli/${VERSION} (aidev_client; os_type=windows; arch=amd64; cl=${CLIENT_CHANGELIST}; auth_method=consumer)`;
 
@@ -90,13 +90,13 @@ const MODEL_ALIASES = {
 };
 
 // ---------------------------------------------------------------------------
-// Credencial (keyring do Windows, mesmo usado pelo agy)
+// Credentials (Windows keyring, the same one used by agy)
 // ---------------------------------------------------------------------------
 
-// A credencial e a seleção de conta vivem em lib/accounts.js (cofre multi-conta).
+// Credentials and account selection live in lib/accounts.js (multi-account vault).
 
 // ---------------------------------------------------------------------------
-// Tradução OpenAI -> Cloud Code (mesmo shape do agy)
+// OpenAI -> Cloud Code translation (same shape as agy)
 // ---------------------------------------------------------------------------
 
 function resolveModel(raw) {
@@ -105,7 +105,7 @@ function resolveModel(raw) {
   if (MODELS[id]) return { id, def: MODELS[id] };
   const alias = MODEL_ALIASES[id];
   if (alias && MODELS[alias]) return { id: alias, def: MODELS[alias] };
-  // fuzzy: prefixo/contains, como o omp faz
+  // fuzzy: prefix or contains, matching the omp behavior
   const found = Object.keys(MODELS).find((k) => k.includes(id) || id.includes(k));
   if (found) return { id: found, def: MODELS[found] };
   return { id: 'gemini-3.8-flash-high', def: MODELS['gemini-3.8-flash-high'] };
@@ -188,7 +188,7 @@ function convertSchema(node, root) {
   for (const key of ['format', 'minimum', 'maximum', 'minItems', 'maxItems', 'minLength', 'maxLength']) {
     if (node[key] !== undefined && ALLOWED_SCHEMA_KEYS.has(key)) out[key] = node[key];
   }
-  // qualquer chave não suportada é descartada de propósito
+  // unsupported keys are intentionally dropped
   return out;
 }
 
@@ -271,7 +271,7 @@ function persistState() {
         })
       );
     } catch (err) {
-      console.warn(`[agy] não foi possível salvar o estado de tool calls: ${err.message}`);
+      console.warn(`[agy] could not save tool call state: ${err.message}`);
     }
   }, 500);
 }
@@ -288,9 +288,9 @@ function rememberToolCall(id, name, signature) {
   persistState();
 }
 
-// O backend do Antigravity recusa (429 RESOURCE_EXHAUSTED) requisições com
-// mais de ~40k tokens de entrada não cacheados. O prompt padrão do omp com
-// muitas skills/MCP passa disso, então aplicamos um orçamento conservador.
+// The Antigravity backend rejects (429 RESOURCE_EXHAUSTED) requests with more
+// than ~40k uncached input tokens. The default omp prompt with many skills/MCP
+// entries exceeds that, so we enforce a conservative budget.
 const MAX_INPUT_TOKENS = Number(process.env.AGY_MAX_INPUT_TOKENS || 38000);
 const CHARS_PER_TOKEN = 3.5;
 
@@ -313,7 +313,7 @@ function trimToBudget(body) {
   if (original <= MAX_INPUT_TOKENS) return { body, trimmedTokens: 0, droppedTurns: 0 };
 
   let droppedTurns = 0;
-  // remove turnos antigos inteiros (nunca separa functionCall de functionResponse)
+  // remove whole old turns (never split functionCall from functionResponse)
   while (estimateTokens(body) > MAX_INPUT_TOKENS) {
     const contents = body.request.contents;
     let first = -1;
@@ -339,7 +339,7 @@ function trimToBudget(body) {
         const before = sys.text.length;
         sys.text =
           sys.text.slice(0, keep) +
-          '\n\n[... catálogo de skills/MCP truncado pelo provider-agy para respeitar o limite de contexto do backend ...]';
+          '\n\n[... skills/MCP catalog truncated by provider-agy to fit the backend context limit ...]';
         trimmedTokens = before - keep;
       }
     }
@@ -396,9 +396,9 @@ function buildCloudRequest(openaiReq, project = PROJECT) {
         const args = safeJsonParse(tc.function.arguments) || {};
         const id = tc.id || `call_${uuid()}`;
         const signature = thoughtSignatures.get(id);
-        // Gemini 3 exige thoughtSignature em todo functionCall. Em sessões antigas
-        // (provider reiniciado antes da persistência), descarta o par tool call/result
-        // em vez de devolver 400.
+        // Gemini 3 requires thoughtSignature on every functionCall. For older
+        // sessions (provider restarted before persistence), drop the tool call/result
+        // pair instead of returning 400.
         if (!signature && model.def.provider === 'google') {
           droppedToolIds.add(id);
           continue;
@@ -452,7 +452,7 @@ function buildCloudRequest(openaiReq, project = PROJECT) {
   const tools = convertTools(openaiReq.tools);
   if (tools) request.tools = tools;
 
-  // mantém a ordem das chaves do agy
+  // keep the agy key order
   const ordered = {
     contents: request.contents,
     ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
@@ -473,7 +473,7 @@ function buildCloudRequest(openaiReq, project = PROJECT) {
   const fitted = trimToBudget(body);
   if (fitted.trimmedTokens || fitted.droppedTurns) {
     console.warn(
-      `[agy] contexto ajustado: ${fitted.trimmedTokens} chars de system e ${fitted.droppedTurns} turno(s) antigos removidos (limite ~${MAX_INPUT_TOKENS} tokens)`
+      `[agy] context trimmed: ${fitted.trimmedTokens} system chars and ${fitted.droppedTurns} old turn(s) removed (limit ~${MAX_INPUT_TOKENS} tokens)`
     );
   }
   return { model, body: fitted.body };
@@ -592,7 +592,7 @@ async function callAccount(body, account) {
 }
 
 // ---------------------------------------------------------------------------
-// Eventos de troca de conta (consumidos pela extensão do omp)
+// Account switch events (consumed by the omp extension)
 // ---------------------------------------------------------------------------
 
 const accountEvents = [];
@@ -602,6 +602,82 @@ const MAX_ACCOUNT_EVENTS = 100;
 const rawStatusEvery = Number(process.env.AGY_STATUS_EVERY || 10);
 const STATUS_EVERY =
   Number.isFinite(rawStatusEvery) && rawStatusEvery > 0 ? Math.floor(rawStatusEvery) : 10;
+
+function tokenNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function normalizeUsage(usage = {}) {
+  const promptTokens = tokenNumber(usage.promptTokenCount);
+  const completionTokens = tokenNumber(usage.candidatesTokenCount);
+  const thoughtTokens = tokenNumber(usage.thoughtsTokenCount);
+  const cachedTokens = tokenNumber(usage.cachedContentTokenCount);
+  const totalTokens = tokenNumber(usage.totalTokenCount) ||
+    promptTokens + completionTokens + thoughtTokens;
+  return { promptTokens, completionTokens, thoughtTokens, cachedTokens, totalTokens };
+}
+
+function emptyStatusWindow() {
+  return {
+    requests: 0,
+    usageRequests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    thoughtTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    last: null,
+    startedAt: new Date().toISOString(),
+  };
+}
+
+let statusWindow = emptyStatusWindow();
+
+function recordSuccessfulRequest({ account, modelId, usage }) {
+  servedRequests += 1;
+  const tokens = normalizeUsage(usage);
+  const reported = Boolean(usage && Object.keys(usage).length);
+  if (reported) {
+    statusWindow.usageRequests += 1;
+    statusWindow.promptTokens += tokens.promptTokens;
+    statusWindow.completionTokens += tokens.completionTokens;
+    statusWindow.thoughtTokens += tokens.thoughtTokens;
+    statusWindow.cachedTokens += tokens.cachedTokens;
+    statusWindow.totalTokens += tokens.totalTokens;
+  }
+  statusWindow.requests += 1;
+  statusWindow.last = {
+    modelId,
+    contextWindow: MODELS[modelId]?.contextWindow || null,
+    reported,
+    ...tokens,
+  };
+
+  if (servedRequests % STATUS_EVERY !== 0) return;
+
+  const stats = {
+    ...statusWindow,
+    averageTotalTokens: Math.round(
+      statusWindow.totalTokens / Math.max(1, statusWindow.usageRequests)
+    ),
+    averagePromptTokens: Math.round(
+      statusWindow.promptTokens / Math.max(1, statusWindow.usageRequests)
+    ),
+    averageCompletionTokens: Math.round(
+      statusWindow.completionTokens / Math.max(1, statusWindow.usageRequests)
+    ),
+    hasUsage: statusWindow.usageRequests > 0,
+  };
+  const totalRequests = servedRequests;
+  statusWindow = emptyStatusWindow();
+  void emitStatusEvent({
+    accountId: account.id,
+    modelId,
+    stats,
+    totalRequests,
+  });
+}
 
 function accountSnapshot(id, modelId) {
   const account = accounts.findAccount(id);
@@ -627,32 +703,32 @@ function pushAccountEvent(event) {
   const from = full.from?.email || full.account?.email || '?';
   const to = full.to?.email || full.account?.email || '?';
   if (full.type === 'switch') {
-    console.warn(`[agy] troca de conta (${full.model}): ${from} -> ${to} [${full.reason}]`);
+    console.warn(`[agy] account switch (${full.model}): ${from} -> ${to} [${full.reason}]`);
   } else if (full.type === 'recovered') {
-    console.warn(`[agy] conta liberada (${full.model}): voltando para ${to}`);
+    console.warn(`[agy] account recovered (${full.model}): returning to ${to}`);
   } else if (full.type === 'blocked') {
     console.error(
-      `\x1b[31m[agy] BLOQUEIO: ${from || 'conta'} recusada pelo Google (${full.statusCode || '?'}); todas as contas foram paradas.\x1b[0m`
+      `\x1b[31m[agy] BLOCK: ${from || 'account'} rejected by Google (${full.statusCode || '?'}); all accounts have been stopped.\x1b[0m`
     );
   } else if (full.type === 'status') {
     console.log(
-      `[agy] status (${full.requests} requisições): ${to} | ${full.account?.remainingFraction != null ? Math.round(full.account.remainingFraction * 100) + '% restante' : 'sem leitura'}`
+      `[agy] status (${full.requests} requests): ${to} | ${full.account?.remainingFraction != null ? Math.round(full.account.remainingFraction * 100) + '% remaining' : 'no reading'} | ${full.window?.totalTokens || 0} tokens in window`
     );
   }
 }
 
 function blockedMessage() {
   const block = accounts.getBlock();
-  const who = block?.email || block?.accountId || 'uma conta';
-  const detail = block?.message ? ` Detalhe: ${block.message}` : '';
+  const who = block?.email || block?.accountId || 'an account';
+  const detail = block?.message ? ` Detail: ${block.message}` : '';
   return [
-    `BLOQUEIO DE SEGURANÇA: o Google recusou ${who} por possível banimento, suspensão ou violação de termos.${detail}`,
-    'O provider parou de usar TODAS as contas e não fará novas tentativas.',
-    'Resolva a situação com o Google e depois rode: npm run accounts -- unblock',
+    `SECURITY BLOCK: Google rejected ${who} for a possible ban, suspension, or terms violation.${detail}`,
+    'The provider stopped using ALL accounts and will not make further attempts.',
+    'Resolve the issue with Google, then run: npm run accounts -- unblock',
   ].join(' ');
 }
 
-async function emitStatusEvent({ accountId, modelId }) {
+async function emitStatusEvent({ accountId, modelId, stats, totalRequests }) {
   try {
     const account = accounts.findAccount(accountId);
     if (!account) return;
@@ -661,13 +737,15 @@ async function emitStatusEvent({ accountId, modelId }) {
       type: 'status',
       model: modelId,
       reason: 'periodic',
-      requests: servedRequests,
+      requests: totalRequests,
       interval: STATUS_EVERY,
       accountRequests: account.requestCount || 0,
+      contextWindow: MODELS[modelId]?.contextWindow || null,
+      window: stats,
       account: accountSnapshot(accountId, modelId),
     });
   } catch (err) {
-    console.warn(`[agy] falha ao registrar status periódico: ${err.message}`);
+    console.warn(`[agy] failed to record periodic status: ${err.message}`);
   }
 }
 
@@ -704,7 +782,7 @@ async function emitSwitchEvent({ fromId, toId, modelId, reason, message }) {
       to: accountSnapshot(toId, modelId),
     });
   } catch (err) {
-    console.warn(`[agy] falha ao registrar troca de conta: ${err.message}`);
+    console.warn(`[agy] failed to record account switch: ${err.message}`);
   }
 }
 
@@ -719,16 +797,16 @@ async function emitRecoveredEvent({ accountId, previousActive, modelId }) {
       to: accountSnapshot(accountId, modelId),
     });
   } catch (err) {
-    console.warn(`[agy] falha ao registrar retorno de conta: ${err.message}`);
+    console.warn(`[agy] failed to record account recovery: ${err.message}`);
   }
 }
 
 /**
- * Tenta as contas do cofre na ordem de preferência. Em 429 de quota, marca a
- * conta como esgotada para aquele modelo e passa para a próxima. 429 genérico
- * (limite por requisição) não troca de conta. 401 renova o token e tenta de
- * novo; 5xx tem um retry por conta. Retorna { res } em sucesso ou
- * { statusCode, text } em falha.
+ * Tries vault accounts in preference order. On a quota 429, marks the account
+ * exhausted for that model and moves to the next one. A generic 429 (request
+ * limit) does not switch accounts. A 401 refreshes the token and retries;
+ * 5xx gets one retry per account. Returns { res } on success or
+ * { statusCode, text } on failure.
  */
 async function postWithAccounts(body, modelId) {
   const tried = new Set();
@@ -755,10 +833,6 @@ async function postWithAccounts(body, modelId) {
 
       if (out.ok) {
         const info = accounts.markSuccess(account.id, modelId);
-        servedRequests += 1;
-        if (servedRequests % STATUS_EVERY === 0) {
-          void emitStatusEvent({ accountId: account.id, modelId });
-        }
         if (pendingSwitch && pendingSwitch.fromId !== account.id) {
           void emitSwitchEvent({ ...pendingSwitch, toId: account.id, modelId });
         } else if (info.recovered && info.previousActive !== account.id) {
@@ -772,16 +846,16 @@ async function postWithAccounts(body, modelId) {
       }
 
       if (out.tokenError) {
-        console.warn(`[agy] conta ${account.email} indisponível (${out.tokenError}); tentando a próxima`);
+        console.warn(`[agy] account ${account.email} unavailable (${out.tokenError}); trying next`);
         if (!pendingSwitch) {
           pendingSwitch = { fromId: account.id, reason: 'invalid', message: out.tokenError };
         }
-        last = { statusCode: 502, text: `conta ${account.email}: ${out.tokenError}` };
+        last = { statusCode: 502, text: `account ${account.email}: ${out.tokenError}` };
         break;
       }
 
       if (out.networkError) {
-        last = { statusCode: 502, text: `conta ${account.email}: ${out.networkError}` };
+        last = { statusCode: 502, text: `account ${account.email}: ${out.networkError}` };
         if (attempt < 2) {
           await sleep(1500 * attempt);
           continue;
@@ -792,7 +866,7 @@ async function postWithAccounts(body, modelId) {
         break;
       }
 
-      // Banimento/suspensão: para tudo na hora, sem tentar outra conta.
+      // Ban/suspension: stop immediately without trying another account.
       if (accounts.isBanError(out.text)) {
         const block = accounts.blockAll({
           accountId: account.id,
@@ -820,13 +894,13 @@ async function postWithAccounts(body, modelId) {
       if (out.statusCode === 429) {
         const quota = accounts.parseQuotaExhaustion(out.text);
         if (!quota.isQuota) {
-          // Limite por requisição (ex.: entrada grande no Gemini): trocar de
-          // conta não resolve e queimaria as demais.
+          // Per-request limit (for example, a large Gemini input): switching
+          // accounts would not help and would burn the others.
           return { statusCode: 429, headers: out.headers, text: out.text };
         }
         accounts.markExhausted(account.id, modelId, quota.resetAt, quota.message);
         console.warn(
-          `[agy] quota de ${modelId} esgotada em ${account.email} (reset ${quota.resetAt}); tentando a próxima conta`
+          `[agy] quota for ${modelId} exhausted on ${account.email} (reset ${quota.resetAt}); trying next account`
         );
         if (!pendingSwitch) {
           pendingSwitch = { fromId: account.id, reason: 'quota', message: quota.message };
@@ -859,15 +933,15 @@ async function postWithAccounts(body, modelId) {
   if (last) {
     const suffix = next
       ? last.statusCode === 429
-        ? `\n\nTodas as contas do cofre estão sem quota para ${modelId}. Próxima liberação: ${next}.`
-        : `\n\nNenhuma conta do cofre conseguiu responder para ${modelId}. Próxima quota disponível: ${next}.`
+        ? `\n\nAll vault accounts are out of quota for ${modelId}. Next reset: ${next}.`
+        : `\n\nNo vault account could respond for ${modelId}. Next quota available: ${next}.`
       : '';
     return { statusCode: last.statusCode, text: last.text + suffix };
   }
   const err = new Error(
     next
-      ? `todas as contas do cofre estão sem quota para ${modelId}; próxima liberação em ${next}`
-      : `nenhuma conta disponível para ${modelId}`
+      ? `all vault accounts are out of quota for ${modelId}; next reset at ${next}`
+      : `no account available for ${modelId}`
   );
   err.code = 'NO_ACCOUNTS';
   err.statusCode = next ? 429 : 503;
@@ -964,7 +1038,7 @@ function consumePart(part, state) {
   }
 
   if (part.thoughtSignature && !part.text) {
-    // assinatura solta: pertence ao próximo functionCall (ou ao turno)
+    // loose signature: belongs to the next functionCall (or this turn)
     state.pendingSignature = part.thoughtSignature;
     return out;
   }
@@ -1056,7 +1130,7 @@ async function handleChat(req, res, payload) {
   try {
     cloud = buildCloudRequest(payload);
   } catch (err) {
-    sendJson(res, 400, openAiError(`request inválido: ${err.message}`, 400, 'invalid_request_error'));
+    sendJson(res, 400, openAiError(`invalid request: ${err.message}`, 400, 'invalid_request_error'));
     return;
   }
 
@@ -1077,13 +1151,13 @@ async function handleChat(req, res, payload) {
     sendJson(
       res,
       err.statusCode || 502,
-      openAiError(`falha ao falar com o Cloud Code: ${err.message}`, err.statusCode || 502)
+      openAiError(`failed to reach Cloud Code: ${err.message}`, err.statusCode || 502)
     );
     return;
   }
 
   if (!result.res) {
-    let text = result.text || 'falha no Cloud Code';
+    let text = result.text || 'Cloud Code failure';
     console.error(`[agy] upstream ${result.statusCode}: ${text.slice(0, 800)}`);
     try {
       const parsed = JSON.parse(text);
@@ -1097,7 +1171,7 @@ async function handleChat(req, res, payload) {
 
   const upstream = result.res;
   console.log(
-    `[agy] model=${model.id} conta=${result.account.email || result.account.id} bytes=${Buffer.byteLength(JSON.stringify(cloud.body))} status=${upstream.statusCode}`
+    `[agy] model=${model.id} account=${result.account.email || result.account.id} bytes=${Buffer.byteLength(JSON.stringify(cloud.body))} status=${upstream.statusCode}`
   );
 
   if (!stream) {
@@ -1133,6 +1207,11 @@ async function handleChat(req, res, payload) {
             completion_tokens: usage.candidatesTokenCount || 0,
             total_tokens: usage.totalTokenCount || 0,
           },
+        });
+        recordSuccessfulRequest({
+          account: result.account,
+          modelId: model.id,
+          usage: state.usage,
         });
       },
       (err) => {
@@ -1202,6 +1281,11 @@ async function handleChat(req, res, payload) {
       }
       res.write('data: [DONE]\n\n');
       res.end();
+      recordSuccessfulRequest({
+        account: result.account,
+        modelId: model.id,
+        usage: state.usage,
+      });
     },
     (err) => {
       if (handleStreamFailure(err, res, model.id, result.account)) {
@@ -1275,7 +1359,7 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       let payload;
       try { payload = JSON.parse(raw || '{}'); } catch {
-        sendJson(res, 400, openAiError('JSON inválido', 400, 'invalid_request_error'));
+        sendJson(res, 400, openAiError('invalid JSON', 400, 'invalid_request_error'));
         return;
       }
       handleChat(req, res, payload).catch((err) => {
@@ -1290,31 +1374,31 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`provider-agy ${VERSION} ouvindo em http://${HOST}:${PORT}/v1`);
-  console.log(`modelos: ${Object.keys(MODELS).join(', ')}`);
-  // importa a conta logada no agy (se ainda não estiver no cofre) e atualiza
-  // projeto/quota de todas as contas em background, sem bloquear o boot
+  console.log(`provider-agy ${VERSION} listening at http://${HOST}:${PORT}/v1`);
+  console.log(`models: ${Object.keys(MODELS).join(', ')}`);
+  // import the account currently signed in to agy (if not in the vault yet)
+  // and refresh project/quota for all accounts in the background
   accounts.bootstrap().then(
     async () => {
       const block = accounts.getBlock();
       if (block) {
         console.error(
-          `\x1b[31m[agy] contas bloqueadas desde ${block.at} (${block.email || block.accountId || '?'}): nenhuma tentativa será feita. Rode: npm run accounts -- unblock\x1b[0m`
+          `\x1b[31m[agy] accounts blocked since ${block.at} (${block.email || block.accountId || '?'}): no attempts will be made. Run: npm run accounts -- unblock\x1b[0m`
         );
         return;
       }
       const list = accounts.listAccounts();
-      console.log(`cofre: ${list.length} conta(s) [${list.map((a) => a.email || a.id).join(', ')}]`);
+      console.log(`vault: ${list.length} account(s) [${list.map((a) => a.email || a.id).join(', ')}]`);
       for (const account of list) {
         try {
           await accounts.refreshAccountMeta(account);
         } catch (err) {
-          console.warn(`aviso (${account.email || account.id}): ${err.message}`);
+          console.warn(`warning (${account.email || account.id}): ${err.message}`);
         }
       }
-      console.log('quotas atualizadas');
+      console.log('quotas refreshed');
     },
-    (err) => console.error(`aviso: ${err.message}`)
+    (err) => console.error(`warning: ${err.message}`)
   );
 });
 

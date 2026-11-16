@@ -78,12 +78,12 @@ if ($Action -eq "read") {
 
 if ($Action -eq "write") {
   if (-not $InFile) {
-    Write-Error "InFile é obrigatório para write"
+    Write-Error "InFile is required for write"
     exit 1
   }
   $bytes = [IO.File]::ReadAllBytes((Join-Path (Get-Location) $InFile))
   if ($bytes.Length -eq 0) {
-    Write-Error "blob vazio"
+    Write-Error "empty blob"
     exit 1
   }
   $blob = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
@@ -124,5 +124,5 @@ if ($Action -eq "delete") {
   exit 0
 }
 
-Write-Error "Action inválida: $Action"
+Write-Error "Invalid action: $Action"
 exit 1

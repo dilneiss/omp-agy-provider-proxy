@@ -3,6 +3,33 @@
 
 const accounts = require('../lib/accounts');
 
+const COLOR =
+  !process.env.NO_COLOR &&
+  (process.env.FORCE_COLOR === '1' || Boolean(process.stdout.isTTY));
+
+function paint(code, text) {
+  return COLOR ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
+const style = {
+  bold: (text) => paint('1', text),
+  dim: (text) => paint('2', text),
+  gray: (text) => paint('90', text),
+  red: (text) => paint('31', text),
+  green: (text) => paint('32', text),
+  yellow: (text) => paint('33', text),
+  cyan: (text) => paint('36', text),
+};
+
+const MODEL_LABELS = {
+  'gemini-3.8-flash-high': 'Gemini 3.8 Flash · High',
+  'gemini-3.8-flash-medium': 'Gemini 3.8 Flash · Medium',
+  'gemini-3.8-flash-low': 'Gemini 3.8 Flash · Low',
+  'claude-sonnet-4-6': 'Claude Sonnet 4.6',
+  'claude-opus-4-6-thinking': 'Claude Opus 4.6 · Thinking',
+  'gpt-oss-120b-medium': 'GPT-OSS 120B · Medium',
+};
+
 function fmtPct(value) {
   if (value == null) return '?';
   return `${Math.round(value * 100)}%`;
@@ -12,7 +39,85 @@ function fmtReset(value) {
   if (!value) return '-';
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) return value;
-  return new Date(ms).toLocaleString('pt-BR');
+  return new Date(ms).toLocaleString('en-US');
+}
+
+function fmtResetShort(value) {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return value || '-';
+  const date = new Date(ms);
+  const now = new Date();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hour = String(date.getHours()).padStart(2, '0');
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  const year = date.getFullYear() === now.getFullYear() ? '' : `/${date.getFullYear()}`;
+  return `${month}/${day}${year} ${hour}:${minute}`;
+}
+
+function fmtRelative(value) {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return '';
+  const diff = ms - Date.now();
+  if (diff <= 0) return 'expired';
+  const minutes = Math.ceil(diff / 60000);
+  if (minutes < 60) return `in ${minutes}min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const rest = minutes % 60;
+    return `in ${hours}h${rest ? ` ${rest}min` : ''}`;
+  }
+  const days = Math.floor(hours / 24);
+  const rest = hours % 24;
+  return `in ${days}d${rest ? ` ${rest}h` : ''}`;
+}
+
+function quotaPct(q) {
+  if (!q) return null;
+  if (q.remainingFraction != null) return Math.round(q.remainingFraction * 100);
+  if (q.resetTime) return 0;
+  return null;
+}
+
+function pctTone(pct) {
+  if (pct == null) return 'gray';
+  if (pct <= 0) return 'red';
+  if (pct < 50) return 'yellow';
+  return 'green';
+}
+
+function accountTone(account) {
+  if (account.invalid) return 'red';
+  const values = accounts.SUPPORTED_MODELS.map((model) => quotaPct(account.quota?.[model])).filter(
+    (value) => value != null
+  );
+  if (!values.length) return 'gray';
+  if (values.every((value) => value <= 0)) return 'red';
+  if (values.some((value) => value < 50)) return 'yellow';
+  return 'green';
+}
+
+function quotaBar(pct, width = 16) {
+  const filled = pct == null ? 0 : Math.round((Math.max(0, Math.min(100, pct)) / 100) * width);
+  const tone = pctTone(pct);
+  return style[tone](`${'█'.repeat(filled)}${'░'.repeat(width - filled)}`);
+}
+
+function quotaReset(q) {
+  if (!q?.resetTime) return '';
+  return `${fmtResetShort(q.resetTime)} (${fmtRelative(q.resetTime)})`;
+}
+
+function printBlockWarning() {
+  const block = accounts.getBlock();
+  if (!block) return;
+  console.log('\x1b[31m' + '='.repeat(70));
+  console.log('ACCOUNTS BLOCKED - the provider stopped making new attempts');
+  console.log(`Account: ${block.email || block.accountId || '?'} | model: ${block.modelId || '?'}`);
+  console.log(`Reason: ${block.message || 'ban/suspension error'}`);
+  console.log(`Since: ${new Date(block.at).toLocaleString('en-US')}`);
+  console.log('Resolve it with Google and run: npm run accounts -- unblock');
+  console.log('='.repeat(70) + '\x1b[0m');
 }
 
 function quotaSummary(account) {
@@ -31,124 +136,163 @@ function quotaSummary(account) {
 }
 
 function printList() {
-  const block = accounts.getBlock();
-  if (block) {
-    console.log('\x1b[31m' + '='.repeat(70));
-    console.log('CONTAS BLOQUEADAS — o provider parou de fazer novas tentativas');
-    console.log(`Conta: ${block.email || block.accountId || '?'} | modelo: ${block.modelId || '?'}`);
-    console.log(`Motivo: ${block.message || 'erro de banimento/suspensão'}`);
-    console.log(`Desde: ${new Date(block.at).toLocaleString('pt-BR')}`);
-    console.log('Resolva com o Google e rode: npm run accounts -- unblock');
-    console.log('='.repeat(70) + '\x1b[0m');
-  }
+  printBlockWarning();
   const list = accounts.publicList();
   if (!list.length) {
-    console.log('Nenhuma conta no cofre. Rode: npm run accounts -- add');
+    console.log('No accounts in the vault. Run: npm run accounts -- add');
     return;
   }
-  console.log(`Contas no cofre (${list.length}):`);
+  console.log(`Vault accounts (${list.length}):`);
   list.forEach((a, i) => {
     const active = a.active ? '*' : ' ';
-    const invalid = a.invalid ? ' [inválida]' : '';
+    const invalid = a.invalid ? ' [invalid]' : '';
     console.log(`${active} ${i + 1}. ${a.email || a.id}${invalid}`);
-    console.log(`     projeto: ${a.project}`);
-    if (a.requestCount) console.log(`     requisições: ${a.requestCount}`);
-    if (a.lastError) console.log(`     erro: ${a.lastError}`);
+    console.log(`     project: ${a.project}`);
+    if (a.requestCount) console.log(`     requests: ${a.requestCount}`);
+    if (a.lastError) console.log(`     error: ${a.lastError}`);
     const summary = quotaSummary(a);
     if (summary) console.log(`     quota: ${summary}`);
   });
-  console.log('\n* = conta ativa no provider');
+  console.log('\n* = active provider account');
 }
 
 async function cmdAdd(label) {
   const account = accounts.importFromKeyring(label);
-  console.log(`Importada: ${account.email || account.id}`);
+  console.log(`Imported: ${account.email || account.id}`);
   try {
     await accounts.refreshAccountMeta(account);
-    console.log(`Projeto: ${account.project}`);
+    console.log(`Project: ${account.project}`);
     const summary = quotaSummary(account);
     if (summary) console.log(`Quota: ${summary}`);
   } catch (err) {
-    console.log(`Aviso: não foi possível consultar projeto/quota agora (${err.message})`);
+    console.log(`Warning: could not fetch project/quota right now (${err.message})`);
   }
-  console.log('O token anterior não foi removido do cofre.');
+  console.log('The previous token was not removed from the vault.');
 }
 
 async function cmdUse(query) {
   const account = accounts.findAccount(query);
-  if (!account) throw new Error(`conta não encontrada: ${query}`);
+  if (!account) throw new Error(`account not found: ${query}`);
   accounts.writeAccountToKeyring(account);
-  console.log(`agy agora usa: ${account.email || account.id}`);
-  console.log('O provider continua com todas as contas no cofre.');
+  console.log(`agy now uses: ${account.email || account.id}`);
+  console.log('The provider still uses all accounts in the vault.');
 }
 
 async function cmdQuota() {
-  const list = accounts.listAccounts();
-  if (!list.length) {
-    console.log('Nenhuma conta no cofre. Rode: npm run accounts -- add');
+  const accountsList = accounts
+    .publicList()
+    .sort((a, b) => Number(b.active) - Number(a.active) || String(a.email || '').localeCompare(String(b.email || '')));
+  if (!accountsList.length) {
+    console.log('No accounts in the vault. Run: npm run accounts -- add');
     return;
   }
-  for (const account of list) {
-    console.log(`\n=== ${account.email || account.id} (${account.project || accounts.DEFAULT_PROJECT})`);
+
+  console.log('');
+  console.log(style.bold('provider-agy quotas'));
+  console.log(
+    style.dim(
+      `${accountsList.length} ${accountsList.length === 1 ? 'account' : 'accounts'} · updated ${fmtResetShort(
+        new Date().toISOString()
+      )}`
+    )
+  );
+  printBlockWarning();
+
+  for (const [index, account] of accountsList.entries()) {
+    let refreshError = null;
     try {
       await accounts.refreshAccountMeta(account);
-      for (const model of accounts.SUPPORTED_MODELS) {
-        const q = account.quota?.[model];
-        if (!q) {
-          console.log(`${model}: sem informação`);
-          continue;
-        }
-        if (q.remainingFraction != null) {
-          console.log(`${model}: ${fmtPct(q.remainingFraction)} restante, reset ${fmtReset(q.resetTime)}`);
-        } else {
-          console.log(`${model}: 0% restante, reset ${fmtReset(q.resetTime)}`);
-        }
-      }
     } catch (err) {
-      console.log(`erro: ${err.message}`);
+      refreshError = err.message;
+    }
+    const live = accounts.findAccount(account.id) || account;
+    const merged = { ...account, ...live };
+    const tone = accountTone(merged);
+    const known = accounts.SUPPORTED_MODELS.map((model) => quotaPct(merged.quota?.[model])).filter(
+      (value) => value != null
+    );
+    const available = known.filter((value) => value > 0).length;
+    const badges = [];
+    if (account.active) badges.push(style.cyan('ACTIVE'));
+    if (account.invalid) badges.push(style.red('INVALID'));
+    if (known.length) {
+      badges.push(style[tone](`${available}/${known.length} models available`));
+    }
+
+    console.log('');
+    const badgeText = badges.length ? `  ${badges.join(style.dim(' · '))}` : '';
+    console.log(
+      `${style[tone]('●')} ${style.bold(`${index + 1}. ${live.email || live.id}`)}${badgeText}`
+    );
+    console.log(`   ${style.dim('project')} ${live.project || accounts.DEFAULT_PROJECT}`);
+    if (refreshError) console.log(`   ${style.red(`refresh error: ${refreshError}`)}`);
+    console.log(style.dim(`   ${'─'.repeat(84)}`));
+    console.log(
+      style.dim(`   ${'MODEL'.padEnd(30)}  ${'QUOTA'.padEnd(16)}  ${'LEFT'.padStart(5)}  RESET`)
+    );
+
+    for (const model of accounts.SUPPORTED_MODELS) {
+      const q = live.quota?.[model];
+      const pct = quotaPct(q);
+      const label = MODEL_LABELS[model] || model;
+      const pctText = pct == null ? '    ?' : `${String(pct).padStart(4)}%`;
+      const resetText = quotaReset(q);
+      console.log(
+        `   ${label.padEnd(30)}  ${quotaBar(pct, 16)}  ${style[pctTone(pct)](pctText)}  ${
+          resetText ? style.dim(resetText) : style.dim('—')
+        }`
+      );
     }
   }
+
+  console.log('');
+  console.log(
+    `${style.green('●')} healthy  ${style.yellow('●')} attention  ${style.red('●')} exhausted  ${style.gray('○')} no data`
+  );
+  console.log(
+    style.dim('The provider uses the active account first and switches automatically when a quota runs out.')
+  );
 }
 
 function cmdRemove(query) {
   const account = accounts.removeAccount(query);
-  console.log(`Removida do cofre: ${account.email || account.id} (o keyring não foi alterado)`);
+  console.log(`Removed from vault: ${account.email || account.id} (keyring unchanged)`);
 }
 
 function cmdUnblock() {
   const previous = accounts.unblockAll();
   if (!previous) {
-    console.log('As contas não estavam bloqueadas.');
+    console.log('Accounts were not blocked.');
     return;
   }
-  console.log(`Bloqueio removido (era ${previous.email || previous.accountId || '?'} desde ${previous.at}).`);
-  console.log('O provider volta a tentar as contas na próxima requisição.');
+  console.log(`Block removed (was ${previous.email || previous.accountId || '?'} since ${previous.at}).`);
+  console.log('The provider will try accounts again on the next request.');
 }
 
 function cmdLogin() {
-  console.log(`Fluxo para adicionar outra conta sem perder as atuais:
+  console.log(`Add another account without losing the current one:
 
-1. Salve a conta que está logada agora:
+1. Save the account that is signed in now:
    npm run accounts -- add
 
-2. No agy, entre na outra conta (por exemplo com /login na TUI ou agy acp --login).
+2. Sign in to the other account in agy (for example /login in the TUI or agy acp --login).
 
-3. Importe a nova conta para o cofre:
+3. Import the new account into the vault:
    npm run accounts -- add
 
-4. Veja as contas e quotas:
+4. Check accounts and quotas:
    npm run accounts -- list
    npm run accounts -- quota
 
-5. Para o agy abrir com uma conta específica:
-   npm run accounts -- use <email-ou-índice>
+5. Make agy use a specific account:
+   npm run accounts -- use <email-or-index>
 
-Se o Google recusar uma conta por banimento/suspensão, o provider bloqueia
-todas as contas e para as tentativas. Depois de resolver, libere com:
+If Google rejects an account for a ban/suspension, the provider blocks all
+accounts and stops attempts. After resolving it, unlock with:
    npm run accounts -- unblock
 
-O provider usa o cofre inteiro e troca de conta sozinho quando a quota de
-uma acaba. O keyring do agy só muda quando você roda "use".`);
+The provider uses the entire vault and switches accounts automatically when
+quota runs out. The agy keyring only changes when you run "use".`);
 }
 
 (async () => {
@@ -166,11 +310,11 @@ uma acaba. O keyring do agy só muda quando você roda "use".`);
     }
     if (cmd === 'help' || cmd === '--help' || cmd === '-h') return cmdLogin();
 
-    console.error(`comando desconhecido: ${cmd}`);
+    console.error(`unknown command: ${cmd}`);
     cmdLogin();
     process.exitCode = 1;
   } catch (err) {
-    console.error(`erro: ${err.message}`);
+    console.error(`error: ${err.message}`);
     process.exitCode = 1;
   }
 })();

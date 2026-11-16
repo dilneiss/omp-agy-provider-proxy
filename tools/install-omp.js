@@ -1,7 +1,7 @@
 'use strict';
 
-// Instala a extensão do omp que sobe o provider automaticamente e exibe os
-// avisos de troca de conta.
+// Installs the omp extension that starts the provider automatically and shows
+// account switch notices.
 
 const fs = require('fs');
 const os = require('os');
@@ -17,7 +17,7 @@ const source = path.join(repoDir, 'omp-extension', 'provider-agy.ts');
 const dest = path.join(extensionsDir, 'provider-agy.ts');
 
 if (!fs.existsSync(source)) {
-  console.error(`extensão não encontrada: ${source}`);
+  console.error(`extension not found: ${source}`);
   process.exit(1);
 }
 
@@ -33,7 +33,7 @@ try {
 config.providerDir = repoDir;
 fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
 
-console.log(`extensão instalada em ${dest}`);
-console.log(`pasta do provider registrada em ${configFile}`);
-console.log('reinicie o omp; na próxima sessão o provider sobe sozinho.');
-console.log('os avisos de troca de conta aparecem na TUI do omp.');
+console.log(`extension installed at ${dest}`);
+console.log(`provider directory registered in ${configFile}`);
+console.log('restart omp; the provider will start automatically on the next session.');
+console.log('account switch notices appear in the omp TUI.');

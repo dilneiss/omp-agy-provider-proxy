@@ -2,7 +2,7 @@
   "name": "provider-agy",
   "version": "1.0.0",
   "private": true,
-  "description": "Provider OpenAI-compatible para omp usando o backend do Antigravity CLI (agy)",
+  "description": "OpenAI-compatible provider for omp using the Antigravity CLI (agy) backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
