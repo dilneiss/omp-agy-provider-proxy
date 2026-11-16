@@ -9,6 +9,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const providerAgy = require('../omp-extension/provider-agy.ts').default;
+const { providerNeedsRestart } = require('../omp-extension/provider-agy.ts');
 
 const LIMITS = { maxInputTokens: 30000, compactAtPercent: 80 };
 
@@ -100,4 +101,14 @@ test('a provider without the limits route never compacts', async () => {
   await session.turnEnd();
 
   assert.equal(session.compactionCount(), 0);
+});
+
+test('a provider running older files is restarted, a matching one is kept', () => {
+  assert.equal(providerNeedsRestart('abc123', 'abc123'), false);
+  assert.equal(providerNeedsRestart('abc123', 'def456'), true);
+  // A provider that predates the handshake cannot report a build at all.
+  assert.equal(providerNeedsRestart(null, 'def456'), true);
+  // Unknown local files must never cause a kill.
+  assert.equal(providerNeedsRestart('abc123', 'unknown'), false);
+  assert.equal(providerNeedsRestart('abc123', ''), false);
 });

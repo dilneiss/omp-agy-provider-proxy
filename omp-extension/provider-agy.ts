@@ -41,8 +41,6 @@ async function isUp() {
   }
 }
 
-async function ensureProvider() {
-  if (await isUp()) return { ok: true, started: false };
 
   const dir = providerDir();
   if (!fs.existsSync(path.join(dir, "server.js"))) {

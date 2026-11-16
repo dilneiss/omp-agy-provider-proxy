@@ -357,6 +357,15 @@ To fit the route, the provider enforces an input budget (`AGY_MAX_INPUT_TOKENS`,
 
 Measured: the backend accepts ~35k and ~75k real prompt tokens and rejects ~167k, so the budget keeps a wide margin.
 
+### Provider restarts itself when the code changes
+
+The extension only used to start the provider when nothing answered on the port, so a process started before an update kept serving the old code indefinitely. Now:
+
+- `GET /health` reports `build` (a sha256 of `server.js` + `lib/accounts.js`), `pid`, and `startedAt`;
+- on every `session_start` the extension compares that `build` with the files on disk;
+- on a mismatch it calls `POST /v1/shutdown`, waits for the port to close, and starts a fresh provider;
+- a provider too old to report `build` also counts as stale; if it refuses to stop, the session shows a notice naming the port to free.
+
 ### Automatic compaction at 80%
 
 The client's own accounting uses the advertised model window (1M), so it never approaches a ratio that would make it compact. The extension closes that gap:

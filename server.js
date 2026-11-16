@@ -60,6 +60,21 @@ const PORT = Number(process.env.AGY_PROVIDER_PORT || process.env.PORT || 8788);
 const CLIENT_CHANGELIST = process.env.AGY_CLIENT_CHANGELIST || '1021519450';
 const USER_AGENT = `antigravity/cli/${VERSION} (aidev_client; os_type=windows; arch=amd64; cl=${CLIENT_CHANGELIST}; auth_method=consumer)`;
 
+// A long-lived provider keeps serving whatever code it started with, so the
+// extension needs a cheap way to see that the files on disk moved on. This is
+// derived only from the two files that carry behaviour.
+function codeFingerprint() {
+  try {
+    const parts = [fs.readFileSync(path.join(__dirname, 'server.js')), fs.readFileSync(path.join(__dirname, 'lib', 'accounts.js'))];
+    return crypto.createHash('sha256').update(Buffer.concat(parts)).digest('hex').slice(0, 12);
+  } catch {
+    return 'unknown';
+  }
+}
+
+const BUILD = codeFingerprint();
+const STARTED_AT = new Date().toISOString();
+
 const MODELS = {
   'gemini-3.8-flash-high': {
     name: 'Gemini 3.8 Flash (High)',
@@ -1748,6 +1763,9 @@ const server = http.createServer((req, res) => {
       ok: true,
       provider: 'provider-agy',
       version: VERSION,
+      build: BUILD,
+      pid: process.pid,
+      startedAt: STARTED_AT,
       blocked: accounts.getBlock(),
       accounts: list.map((a) => ({
         email: a.email,
@@ -1779,6 +1797,17 @@ const server = http.createServer((req, res) => {
       ? accountEvents.filter((event) => event.seq > since)
       : [];
     sendJson(res, 200, { object: 'list', lastSeq: accountEventSeq, data });
+    return;
+  }
+
+  // Used by the extension to replace a provider that is still running older
+  // code. Loopback-only by default, and it changes nothing but this process.
+  if (req.method === 'POST' && (url.pathname === '/v1/shutdown' || url.pathname === '/shutdown')) {
+    sendJson(res, 200, { ok: true, provider: 'provider-agy', build: BUILD, pid: process.pid });
+    setTimeout(() => {
+      try { server.close(() => process.exit(0)); } catch { process.exit(0); }
+      setTimeout(() => process.exit(0), 1000).unref();
+    }, 50).unref();
     return;
   }
 
